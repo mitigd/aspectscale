@@ -1,4 +1,5 @@
 #include "x11_scale.h"
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -371,7 +372,18 @@ bool x11_scale_window(Display *dpy, Window w, WindowScaleInfo *info) {
 
     int new_w, new_h, new_x, new_y;
 
-    if (mon_ar > ar) {
+    if (config_get_scale_mode() == SCALE_FILTER_INTEGER) {
+        int scale_x = mon.width / cur_rect.width;
+        int scale_y = mon.height / cur_rect.height;
+        int scale = (scale_x < scale_y) ? scale_x : scale_y;
+        if (scale < 1) scale = 1;
+        new_w = cur_rect.width * scale;
+        new_h = cur_rect.height * scale;
+        if (new_w > mon.width) new_w = mon.width;
+        if (new_h > mon.height) new_h = mon.height;
+        new_x = mon.x + (mon.width - new_w) / 2;
+        new_y = mon.y + (mon.height - new_h) / 2;
+    } else if (mon_ar > ar) {
         /* Monitor is wider: pillarbox (full height, centered width) */
         new_h = mon.height;
         new_w = (int)lround((double)mon.height * ar);

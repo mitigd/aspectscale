@@ -29,7 +29,16 @@ install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 	install -d $(DESTDIR)$(DATADIR)/applications
-	install -m 644 aspectscale.desktop $(DESTDIR)$(DATADIR)/applications/aspectscale.desktop
+	sed -e 's|Exec=aspectscale|Exec=$(BINDIR)/$(TARGET)|' \
+	    aspectscale.desktop > $(DESTDIR)$(DATADIR)/applications/aspectscale.desktop
+
+install-user: $(TARGET)
+	install -d $(HOME)/.local/bin
+	install -m 755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
+	install -d $(HOME)/.local/share/applications
+	sed -e 's|Exec=aspectscale|Exec=$(HOME)/.local/bin/$(TARGET)|' \
+	    aspectscale.desktop > $(HOME)/.local/share/applications/aspectscale.desktop
+	update-desktop-database $(HOME)/.local/share/applications/ >/dev/null 2>&1 || true
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)

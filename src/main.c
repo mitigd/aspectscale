@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "x11_scale.h"
 #include "gl_scaler.h"
@@ -23,6 +24,7 @@ typedef struct {
     GtkWidget *menu;
     GtkWidget *remembered_submenu;
     GtkWidget *remember_item;
+    GtkWidget *scale_mode_parent;
     bool running;
     pthread_t hotkey_thread;
     KeyCode keycode_s;
@@ -100,6 +102,7 @@ static void trigger_scale_window(Window target) {
     x11_get_window_title(g_app.main_dpy, target, title, sizeof(title));
 
     gl_scaler_set_hide_cursor(config_get_hide_cursor());
+    gl_scaler_set_scale_mode(config_get_scale_mode());
 
     if (gl_scaler_start(g_app.main_dpy, target)) {
         g_app.dismissed_win = None;
@@ -345,6 +348,31 @@ static void rebuild_remembered_submenu(void) {
     gtk_widget_show_all(g_app.remembered_submenu);
 }
 
+static void update_scale_mode_parent_label(ScaleFilterMode mode) {
+    if (!g_app.scale_mode_parent) return;
+    const char *label = "Scaling: Filtering (Bilinear)";
+    if (mode == SCALE_FILTER_INTEGER) label = "Scaling: Integer (Pixel-Perfect)";
+    else if (mode == SCALE_FILTER_NEAREST) label = "Scaling: No Filtering (Sharp)";
+    gtk_menu_item_set_label(GTK_MENU_ITEM(g_app.scale_mode_parent), label);
+}
+
+static void on_scale_mode_toggled(GtkCheckMenuItem *item, gpointer user_data) {
+    if (!gtk_check_menu_item_get_active(item)) return;
+    ScaleFilterMode mode = (ScaleFilterMode)GPOINTER_TO_INT(user_data);
+    config_set_scale_mode(mode);
+    gl_scaler_set_scale_mode(mode);
+    update_scale_mode_parent_label(mode);
+
+    if (config_get_notifications()) {
+        const char *name = (mode == SCALE_FILTER_INTEGER) ? "Integer Scaling (Pixel-Perfect)" :
+                           ((mode == SCALE_FILTER_NEAREST) ? "No Filtering (Nearest Neighbor)" :
+                            "Filtering (Bilinear)");
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Scaling mode set to: %s", name);
+        notify_message("AspectScale", msg);
+    }
+}
+
 static void on_about_clicked(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     (void)user_data;
@@ -355,11 +383,15 @@ static void on_about_clicked(GtkMenuItem *item, gpointer user_data) {
         GTK_MESSAGE_INFO,
         GTK_BUTTONS_OK,
         "%s v%s\n\n"
-        "Lossless Scaling / Aspect-Corrected Fullscreen for Linux\n\n"
+        "Aspect-Corrected Fullscreen Scaler for Linux\n\n"
         "• Global Shortcut: Ctrl + Alt + S\n"
         "  Scales active window to fullscreen with hardware OpenGL,\n"
         "  preserving aspect ratio with pure black borders and covering panels.\n"
         "  Pressing again or Esc exits fullscreen.\n\n"
+        "• Scaling & Filtering Options:\n"
+        "  - Filtering (Bilinear): Smooth aspect-corrected scaling.\n"
+        "  - No Filtering (Nearest): Sharp, crisp nearest-neighbor scaling.\n"
+        "  - Integer Scaling: Pixel-perfect integer ratio scaling with black borders.\n\n"
         "• Auto-Scale on Launch:\n"
         "  Click 'Remember Active Window for Auto-Scale' in the tray.\n"
         "  When that app is opened, it automatically snaps to fullscreen!\n\n"
@@ -377,14 +409,38 @@ static void on_quit_clicked(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     (void)user_data;
     g_app.running = false;
+    if (gl_scaler_is_running()) {
+        gl_scaler_stop();
+    }
+    gl_scaler_cleanup();
+    if (g_app.hotkey_dpy) {
+        XClientMessageEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = ClientMessage;
+        ev.window = DefaultRootWindow(g_app.hotkey_dpy);
+        ev.format = 32;
+        XSendEvent(g_app.hotkey_dpy, DefaultRootWindow(g_app.hotkey_dpy), False, 0, (XEvent *)&ev);
+        XFlush(g_app.hotkey_dpy);
+    }
     gtk_main_quit();
+    exit(0);
+}
+
+static void handle_sigterm(int sig) {
+    (void)sig;
+    g_app.running = false;
+    if (gl_scaler_is_running()) {
+        gl_scaler_stop();
+    }
+    gl_scaler_cleanup();
+    exit(0);
 }
 
 static void build_tray_menu(void) {
     GtkWidget *menu = gtk_menu_new();
 
     /* Header */
-    GtkWidget *header_item = gtk_menu_item_new_with_label("AspectScale (Lossless Fullscreen)");
+    GtkWidget *header_item = gtk_menu_item_new_with_label("AspectScale (Fullscreen Scaler)");
     gtk_widget_set_sensitive(header_item, FALSE);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), header_item);
 
@@ -416,6 +472,42 @@ static void build_tray_menu(void) {
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
+    /* Scaling / Filter mode options */
+    GtkWidget *scale_mode_parent = gtk_menu_item_new_with_label("Scaling Mode");
+    GtkWidget *scale_mode_submenu = gtk_menu_new();
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(scale_mode_parent), scale_mode_submenu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), scale_mode_parent);
+    g_app.scale_mode_parent = scale_mode_parent;
+
+    GSList *sm_group = NULL;
+    GtkWidget *filter_item = gtk_radio_menu_item_new_with_label(sm_group, "Filtering (Bilinear / Smooth)");
+    sm_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(filter_item));
+
+    GtkWidget *nofilter_item = gtk_radio_menu_item_new_with_label(sm_group, "No Filtering (Nearest Neighbor / Sharp)");
+    sm_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(nofilter_item));
+
+    GtkWidget *integer_item = gtk_radio_menu_item_new_with_label(sm_group, "Integer Scaling (Pixel-Perfect)");
+
+    ScaleFilterMode cur_sm = config_get_scale_mode();
+    if (cur_sm == SCALE_FILTER_INTEGER) {
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(integer_item), TRUE);
+    } else if (cur_sm == SCALE_FILTER_NEAREST) {
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(nofilter_item), TRUE);
+    } else {
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(filter_item), TRUE);
+    }
+    update_scale_mode_parent_label(cur_sm);
+
+    g_signal_connect(filter_item, "toggled", G_CALLBACK(on_scale_mode_toggled), GINT_TO_POINTER(SCALE_FILTER_BILINEAR));
+    g_signal_connect(nofilter_item, "toggled", G_CALLBACK(on_scale_mode_toggled), GINT_TO_POINTER(SCALE_FILTER_NEAREST));
+    g_signal_connect(integer_item, "toggled", G_CALLBACK(on_scale_mode_toggled), GINT_TO_POINTER(SCALE_FILTER_INTEGER));
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(scale_mode_submenu), filter_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(scale_mode_submenu), nofilter_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(scale_mode_submenu), integer_item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
     /* Hide Cursor Checkbox */
     GtkWidget *cursor_item = gtk_check_menu_item_new_with_label("Hide Cursor in Fullscreen");
     gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(cursor_item), config_get_hide_cursor());
@@ -444,7 +536,7 @@ static void build_tray_menu(void) {
 }
 
 static void print_usage(const char *prog) {
-    printf("AspectScale v%s - Lossless Aspect-Corrected Scaler for Linux\n\n"
+    printf("AspectScale v%s - Aspect-Corrected Fullscreen Scaler for Linux\n\n"
            "Usage: %s [OPTIONS]\n\n"
            "Options:\n"
            "  -h, --help            Show this help message\n"
@@ -452,6 +544,9 @@ static void print_usage(const char *prog) {
            "  --scale-active        Scale currently active window immediately to fullscreen\n"
            "  --restore-active      Restore currently active window immediately\n"
            "  --remember-active     Add active window to auto-scale list\n"
+           "  --filtering           Set scaling mode to Bilinear Filtering (smooth)\n"
+           "  --no-filtering        Set scaling mode to No Filtering (nearest neighbor / sharp)\n"
+           "  --integer             Set scaling mode to Integer Scaling (pixel-perfect)\n"
            "  --no-hide-cursor      Do not hide cursor in fullscreen\n"
            "  --no-notify           Disable desktop notifications\n"
            "  --no-tray             Run as daemon without system tray icon\n\n"
@@ -489,6 +584,12 @@ int main(int argc, char *argv[]) {
             one_shot_restore = true;
         } else if (strcmp(argv[i], "--remember-active") == 0) {
             one_shot_remember = true;
+        } else if (strcmp(argv[i], "--filtering") == 0) {
+            config_set_scale_mode(SCALE_FILTER_BILINEAR);
+        } else if (strcmp(argv[i], "--no-filtering") == 0 || strcmp(argv[i], "--nearest") == 0) {
+            config_set_scale_mode(SCALE_FILTER_NEAREST);
+        } else if (strcmp(argv[i], "--integer") == 0) {
+            config_set_scale_mode(SCALE_FILTER_INTEGER);
         } else if (strcmp(argv[i], "--no-hide-cursor") == 0) {
             config_set_hide_cursor(false);
         } else if (strcmp(argv[i], "--no-notify") == 0) {
@@ -497,6 +598,9 @@ int main(int argc, char *argv[]) {
             enable_tray = false;
         }
     }
+
+    signal(SIGINT, handle_sigterm);
+    signal(SIGTERM, handle_sigterm);
 
     g_app.main_dpy = XOpenDisplay(NULL);
     if (!g_app.main_dpy) {
@@ -507,6 +611,7 @@ int main(int argc, char *argv[]) {
     x11_scale_init(g_app.main_dpy);
     gl_scaler_init(g_app.main_dpy);
     gl_scaler_set_hide_cursor(config_get_hide_cursor());
+    gl_scaler_set_scale_mode(config_get_scale_mode());
 
     /* Handle one-shot actions */
     if (one_shot_scale) {
@@ -582,20 +687,10 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     g_app.running = false;
-    if (g_app.keycode_s != 0) {
-        x11_ungrab_key(g_app.hotkey_dpy, g_app.keycode_s, ControlMask | Mod1Mask);
+    if (gl_scaler_is_running()) {
+        gl_scaler_stop();
     }
-    if (g_app.keycode_r != 0) {
-        x11_ungrab_key(g_app.hotkey_dpy, g_app.keycode_r, ControlMask | Mod1Mask);
-    }
-
-    pthread_cancel(g_app.hotkey_thread);
-    pthread_join(g_app.hotkey_thread, NULL);
-
     gl_scaler_cleanup();
     x11_scale_cleanup(g_app.main_dpy);
-    XCloseDisplay(g_app.hotkey_dpy);
-    XCloseDisplay(g_app.main_dpy);
-
-    return 0;
+    exit(0);
 }

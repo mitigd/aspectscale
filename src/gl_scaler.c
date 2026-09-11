@@ -89,6 +89,7 @@ static bool s_running = false;
 static pthread_t s_thread;
 static Window s_target_win = None;
 static bool s_hide_cursor = true;
+static volatile ScaleFilterMode s_scale_mode = SCALE_FILTER_BILINEAR;
 
 typedef struct {
     int x;
@@ -138,6 +139,50 @@ static MonitorBounds get_monitor_bounds(Display *dpy, Window w) {
     return mon;
 }
 
+static void calculate_viewport(ScaleFilterMode mode, unsigned int target_w, unsigned int target_h,
+                               const MonitorBounds *mon, int *out_vp_x, int *out_vp_y,
+                               int *out_vp_w, int *out_vp_h, int *out_y_from_top) {
+    int vp_w = 0, vp_h = 0, vp_x = 0, vp_y = 0;
+
+    if (mode == SCALE_FILTER_INTEGER) {
+        int scale_x = mon->width / (int)target_w;
+        int scale_y = mon->height / (int)target_h;
+        int scale = (scale_x < scale_y) ? scale_x : scale_y;
+        if (scale < 1) scale = 1;
+
+        vp_w = (int)target_w * scale;
+        vp_h = (int)target_h * scale;
+        if (vp_w > mon->width) vp_w = mon->width;
+        if (vp_h > mon->height) vp_h = mon->height;
+        vp_x = (mon->width - vp_w) / 2;
+        vp_y = (mon->height - vp_h) / 2;
+    } else {
+        /* Aspect ratio calculation (FIT) */
+        double target_ar = (double)target_w / (double)target_h;
+        double mon_ar = (double)mon->width / (double)mon->height;
+
+        if (mon_ar > target_ar) {
+            vp_h = mon->height;
+            vp_w = (int)lround((double)mon->height * target_ar);
+            if (vp_w > mon->width) vp_w = mon->width;
+            vp_x = (mon->width - vp_w) / 2;
+            vp_y = 0;
+        } else {
+            vp_w = mon->width;
+            vp_h = (int)lround((double)mon->width / target_ar);
+            if (vp_h > mon->height) vp_h = mon->height;
+            vp_x = 0;
+            vp_y = (mon->height - vp_h) / 2;
+        }
+    }
+
+    *out_vp_w = vp_w;
+    *out_vp_h = vp_h;
+    *out_vp_x = vp_x;
+    *out_vp_y = vp_y;
+    *out_y_from_top = mon->height - (vp_y + vp_h);
+}
+
 bool gl_scaler_init(Display *dpy) {
     if (!dpy) return false;
 
@@ -170,6 +215,14 @@ Window gl_scaler_get_target(void) {
 
 void gl_scaler_set_hide_cursor(bool hide) {
     s_hide_cursor = hide;
+}
+
+void gl_scaler_set_scale_mode(ScaleFilterMode mode) {
+    s_scale_mode = mode;
+}
+
+ScaleFilterMode gl_scaler_get_scale_mode(void) {
+    return s_scale_mode;
 }
 
 static void* gl_render_thread(void *arg) {
@@ -361,33 +414,18 @@ static void* gl_render_thread(void *arg) {
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    ScaleFilterMode current_mode = s_scale_mode;
+    GLint filter = (current_mode == SCALE_FILTER_BILINEAR) ? GL_LINEAR : GL_NEAREST;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glEnable(GL_TEXTURE_2D);
 
-    /* Aspect ratio calculation */
-    double target_ar = (double)target_w / (double)target_h;
-    double mon_ar = (double)mon.width / (double)mon.height;
-
-    int vp_w, vp_h, vp_x, vp_y;
-    if (mon_ar > target_ar) {
-        vp_h = mon.height;
-        vp_w = (int)lround((double)mon.height * target_ar);
-        if (vp_w > mon.width) vp_w = mon.width;
-        vp_x = (mon.width - vp_w) / 2;
-        vp_y = 0;
-    } else {
-        vp_w = mon.width;
-        vp_h = (int)lround((double)mon.width / target_ar);
-        if (vp_h > mon.height) vp_h = mon.height;
-        vp_x = 0;
-        vp_y = (mon.height - vp_h) / 2;
-    }
-
-    int y_from_top = mon.height - (vp_y + vp_h);
+    int vp_w = 0, vp_h = 0, vp_x = 0, vp_y = 0, y_from_top = 0;
+    calculate_viewport(current_mode, target_w, target_h, &mon, &vp_x, &vp_y, &vp_w, &vp_h, &y_from_top);
 
     int target_abs_x = 0, target_abs_y = 0;
     Window dummy_child;
@@ -495,6 +533,16 @@ static void* gl_render_thread(void *arg) {
 
         if (!s_running) break;
 
+        /* Check if scale/filter mode changed dynamically */
+        if (s_scale_mode != current_mode) {
+            current_mode = s_scale_mode;
+            GLint new_filter = (current_mode == SCALE_FILTER_BILINEAR) ? GL_LINEAR : GL_NEAREST;
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, new_filter);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, new_filter);
+            calculate_viewport(current_mode, target_w, target_h, &mon, &vp_x, &vp_y, &vp_w, &vp_h, &y_from_top);
+        }
+
         /* Verify target window still exists */
         unsigned int cur_w = 0, cur_h = 0;
         if (!XGetGeometry(dpy, target, &r_ret, &tx, &ty, &cur_w, &cur_h, &tb, &td)) {
@@ -502,6 +550,12 @@ static void* gl_render_thread(void *arg) {
             fprintf(stderr, "AspectScale Debug: XGetGeometry failed for target 0x%lx! Window may be closed or unmapped.\n", (unsigned long)target);
             s_running = false;
             break;
+        }
+
+        if (cur_w != target_w || cur_h != target_h) {
+            target_w = cur_w;
+            target_h = cur_h;
+            calculate_viewport(current_mode, target_w, target_h, &mon, &vp_x, &vp_y, &vp_w, &vp_h, &y_from_top);
         }
 
         /* Full screen clear to pure black */

@@ -13,8 +13,7 @@ done
 if [ -n "$MISSING_TOOLS" ]; then
     echo "Missing build tools:$MISSING_TOOLS"
     echo ""
-    echo "To install the required build packages on Void Linux, run:"
-    echo "  sudo xbps-install -S base-devel libX11-devel libXrandr-devel libayatana-appindicator-devel"
+    echo "Please install build tools (gcc, make, pkg-config) using your package manager."
     echo ""
     exit 1
 fi
@@ -23,16 +22,14 @@ fi
 for pkg in gtk+-3.0 x11 xrandr; do
     if ! pkg-config --exists "$pkg"; then
         echo "Missing pkg-config library: $pkg"
-        echo "Please install development packages:"
-        echo "  sudo xbps-install -S base-devel libX11-devel libXrandr-devel libayatana-appindicator-devel"
+        echo "Please install development headers (GTK 3, X11, Xrandr) using your package manager."
         exit 1
     fi
 done
 
 if ! pkg-config --exists ayatana-appindicator3-0.1 && ! pkg-config --exists appindicator3-0.1; then
-    echo "Missing libayatana-appindicator-devel!"
-    echo "Please install:"
-    echo "  sudo xbps-install -S libayatana-appindicator-devel"
+    echo "Missing libayatana-appindicator or libappindicator development package!"
+    echo "Please install libayatana-appindicator-devel (or equivalent) using your package manager."
     exit 1
 fi
 

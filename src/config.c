@@ -22,6 +22,7 @@ void config_init(void) {
     memset(&s_config, 0, sizeof(AppConfig));
     s_config.hide_cursor = true;
     s_config.show_notifications = true;
+    s_config.scale_mode = SCALE_FILTER_BILINEAR;
     s_config.rule_count = 0;
 
     get_config_path(s_config_path, sizeof(s_config_path));
@@ -60,12 +61,22 @@ void config_init(void) {
                 s_config.hide_cursor = (atoi(val) != 0);
             } else if (strcmp(key, "show_notifications") == 0) {
                 s_config.show_notifications = (atoi(val) != 0);
+            } else if (strcmp(key, "scale_mode") == 0 || strcmp(key, "scaling") == 0 || strcmp(key, "filter") == 0) {
+                if (strcasecmp(val, "integer") == 0 || strcmp(val, "2") == 0) {
+                    s_config.scale_mode = SCALE_FILTER_INTEGER;
+                } else if (strcasecmp(val, "none") == 0 || strcasecmp(val, "nearest") == 0 ||
+                           strcasecmp(val, "no_filtering") == 0 || strcasecmp(val, "no-filtering") == 0 ||
+                           strcmp(val, "1") == 0) {
+                    s_config.scale_mode = SCALE_FILTER_NEAREST;
+                } else {
+                    s_config.scale_mode = SCALE_FILTER_BILINEAR;
+                }
             }
         } else if (strcmp(section, "autoscale") == 0) {
             if (s_config.rule_count < MAX_AUTOSCALE_RULES && strlen(key) > 0) {
                 AutoScaleRule *r = &s_config.rules[s_config.rule_count++];
-                snprintf(r->identifier, sizeof(r->identifier), "%s", key);
-                snprintf(r->label, sizeof(r->label), "%s", val[0] ? val : key);
+                snprintf(r->identifier, sizeof(r->identifier), "%.127s", key);
+                snprintf(r->label, sizeof(r->label), "%.127s", val[0] ? val : key);
             }
         }
     }
@@ -82,7 +93,11 @@ void config_save(void) {
 
     fprintf(f, "[settings]\n");
     fprintf(f, "hide_cursor=%d\n", s_config.hide_cursor ? 1 : 0);
-    fprintf(f, "show_notifications=%d\n\n", s_config.show_notifications ? 1 : 0);
+    fprintf(f, "show_notifications=%d\n", s_config.show_notifications ? 1 : 0);
+    const char *sm = "filtering";
+    if (s_config.scale_mode == SCALE_FILTER_INTEGER) sm = "integer";
+    else if (s_config.scale_mode == SCALE_FILTER_NEAREST) sm = "no_filtering";
+    fprintf(f, "scale_mode=%s\n\n", sm);
 
     fprintf(f, "[autoscale]\n");
     for (int i = 0; i < s_config.rule_count; i++) {
@@ -106,6 +121,15 @@ bool config_get_notifications(void) {
 
 void config_set_notifications(bool enabled) {
     s_config.show_notifications = enabled;
+    config_save();
+}
+
+ScaleFilterMode config_get_scale_mode(void) {
+    return s_config.scale_mode;
+}
+
+void config_set_scale_mode(ScaleFilterMode mode) {
+    s_config.scale_mode = mode;
     config_save();
 }
 
@@ -145,9 +169,9 @@ bool config_add_autoscale(const char *res_class, const char *res_name, const cha
     }
 
     AutoScaleRule *r = &s_config.rules[s_config.rule_count++];
-    snprintf(r->identifier, sizeof(r->identifier), "%s", id);
+    snprintf(r->identifier, sizeof(r->identifier), "%.127s", id);
     const char *lbl = (title && title[0]) ? title : id;
-    snprintf(r->label, sizeof(r->label), "%s", lbl);
+    snprintf(r->label, sizeof(r->label), "%.127s", lbl);
 
     config_save();
     return true;
