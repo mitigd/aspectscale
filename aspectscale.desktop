@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AspectScale
+GenericName=Window Scaler
+Comment=Scale windowed applications to screen resolution while preserving aspect ratio
+Exec=aspectscale
+Icon=view-fullscreen
+Terminal=false
+Categories=Utility;GTK;
+Keywords=window;scale;aspect;fullscreen;ratio;
+StartupNotify=false
