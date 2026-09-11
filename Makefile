@@ -4,7 +4,7 @@ BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 
 APPINDICATOR_PKG := $(shell pkg-config --exists ayatana-appindicator3-0.1 && echo ayatana-appindicator3-0.1 || echo appindicator3-0.1)
-PKG_DEPS := gtk+-3.0 $(APPINDICATOR_PKG) x11 xrandr xcomposite gl
+PKG_DEPS := gtk+-3.0 $(APPINDICATOR_PKG) x11 xrandr xcomposite gl xfixes xcursor xtst
 
 CFLAGS ?= -O2 -g -Wall -Wextra
 CFLAGS += $(shell pkg-config --cflags $(PKG_DEPS))

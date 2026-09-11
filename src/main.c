@@ -41,7 +41,45 @@ static int x11_error_handler(Display *dpy, XErrorEvent *ev) {
 
 static void rebuild_remembered_submenu(void);
 
+static Window resolve_target_window(Display *dpy, Window target) {
+    if (!dpy || target == None) return target;
+
+    Window root = DefaultRootWindow(dpy);
+    Window parent = None, *children = NULL;
+    unsigned int nchildren = 0;
+
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, target, &wa)) return target;
+
+    int scr_w = DisplayWidth(dpy, DefaultScreen(dpy));
+    int scr_h = DisplayHeight(dpy, DefaultScreen(dpy));
+
+    /* If target is already full screen size (e.g. Wine virtual desktop wrapper), look for transient game window */
+    if (wa.width >= scr_w && wa.height >= scr_h) {
+        if (XQueryTree(dpy, root, &root, &parent, &children, &nchildren) && children) {
+            for (int i = (int)nchildren - 1; i >= 0; i--) {
+                Window trans = None;
+                if (XGetTransientForHint(dpy, children[i], &trans) && trans == target) {
+                    XWindowAttributes cwa;
+                    if (XGetWindowAttributes(dpy, children[i], &cwa) && cwa.map_state == IsViewable) {
+                        Window actual = children[i];
+                        fprintf(stderr, "AspectScale Debug: Resolved transient game window 0x%lx for wrapper 0x%lx\n",
+                                (unsigned long)actual, (unsigned long)target);
+                        XFree(children);
+                        return actual;
+                    }
+                }
+            }
+            XFree(children);
+        }
+    }
+    return target;
+}
+
 static void trigger_scale_window(Window target) {
+    target = resolve_target_window(g_app.main_dpy, target);
+    fprintf(stderr, "AspectScale Debug: trigger_scale_window called with target=0x%lx, gl_scaler_running=%d\n",
+            (unsigned long)target, gl_scaler_is_running());
     if (gl_scaler_is_running()) {
         g_app.dismissed_win = gl_scaler_get_target();
         gl_scaler_stop();
@@ -80,10 +118,12 @@ static void trigger_scale_window(Window target) {
 
 static void trigger_scale_active(void) {
     Window active = x11_get_active_window(g_app.main_dpy);
+    fprintf(stderr, "AspectScale Debug: trigger_scale_active() called from somewhere! active=0x%lx\n", (unsigned long)active);
     trigger_scale_window(active);
 }
 
 static void trigger_restore_active(void) {
+    fprintf(stderr, "AspectScale Debug: trigger_restore_active() called\n");
     if (gl_scaler_is_running()) {
         g_app.dismissed_win = gl_scaler_get_target();
         gl_scaler_stop();
@@ -133,6 +173,8 @@ static gboolean autoscale_poll_cb(gpointer user_data) {
             }
 
             if (config_is_autoscale(cls, nam, title)) {
+                fprintf(stderr, "AspectScale Debug: autoscale triggered for win=0x%lx title='%s' class='%s'\n",
+                        (unsigned long)active, title, cls ? cls : "");
                 trigger_scale_window(active);
             }
 
@@ -151,6 +193,7 @@ static gboolean autoscale_poll_cb(gpointer user_data) {
 
 static gboolean on_hotkey_scale_idle(gpointer user_data) {
     (void)user_data;
+    fprintf(stderr, "AspectScale Debug: on_hotkey_scale_idle triggered by hotkey thread!\n");
     trigger_scale_active();
     return G_SOURCE_REMOVE;
 }
@@ -185,6 +228,7 @@ static void* hotkey_listener_thread(void *arg) {
 static void on_scale_clicked(GtkMenuItem *item, gpointer user_data) {
     (void)item;
     (void)user_data;
+    fprintf(stderr, "AspectScale Debug: on_scale_clicked triggered from tray menu!\n");
     trigger_scale_active();
 }
 

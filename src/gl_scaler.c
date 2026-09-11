@@ -4,15 +4,80 @@
 #include <X11/keysym.h>
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xrandr.h>
+#include <X11/extensions/Xfixes.h>
+#include <X11/Xcursor/Xcursor.h>
 #include <GL/gl.h>
 #include <GL/glx.h>
 #include <GL/glxext.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <X11/Xproto.h>
+#include <X11/extensions/record.h>
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+
+typedef struct {
+    Window target;
+    Window target_parent;
+    volatile Cursor pending_cursor;
+    volatile bool pending_valid;
+} RecordCursorContext;
+
+static void record_cursor_cb(XPointer closure, XRecordInterceptData *data) {
+    RecordCursorContext *ctx = (RecordCursorContext *)closure;
+    if (!ctx || !data) return;
+
+    if (data->category == XRecordFromClient) {
+        const unsigned char *buf = data->data;
+        int len = data->data_len * 4;
+        if (len >= (int)sizeof(xChangeWindowAttributesReq)) {
+            const xChangeWindowAttributesReq *req = (const xChangeWindowAttributesReq *)buf;
+            if (req->reqType == X_ChangeWindowAttributes && (req->valueMask & CWCursor)) {
+                if (req->window == ctx->target || (ctx->target_parent != None && req->window == ctx->target_parent)) {
+                    int val_idx = 0;
+                    for (int b = 0; b < 14; b++) {
+                        if (req->valueMask & (1L << b)) val_idx++;
+                    }
+                    const CARD32 *values = (const CARD32 *)(buf + sizeof(xChangeWindowAttributesReq));
+                    ctx->pending_cursor = (Cursor)values[val_idx];
+                    ctx->pending_valid = true;
+                }
+            }
+        }
+    }
+    XRecordFreeData(data);
+}
+
+typedef struct {
+    Display *rec_dpy;
+    XRecordContext rec_ctx;
+    RecordCursorContext *cur_ctx;
+} RecordThreadArg;
+
+static void* record_thread_func(void *arg) {
+    RecordThreadArg *rta = (RecordThreadArg *)arg;
+    XRecordEnableContext(rta->rec_dpy, rta->rec_ctx, record_cursor_cb, (XPointer)rta->cur_ctx);
+    return NULL;
+}
+
+
+static Cursor create_cursor_from_xfixes(Display *dpy, XFixesCursorImage *img) {
+    if (!dpy || !img || img->width == 0 || img->height == 0) return None;
+
+    XcursorImage *xci = XcursorImageCreate(img->width, img->height);
+    if (!xci) return None;
+
+    xci->xhot = img->xhot;
+    xci->yhot = img->yhot;
+    for (int i = 0; i < img->width * img->height; i++) {
+        xci->pixels[i] = (XcursorPixel)img->pixels[i];
+    }
+    Cursor c = XcursorImageLoadCursor(dpy, xci);
+    XcursorImageDestroy(xci);
+    return c;
+}
 
 static PFNGLXBINDTEXIMAGEEXTPROC s_glXBindTexImage = NULL;
 static PFNGLXRELEASETEXIMAGEEXTPROC s_glXReleaseTexImage = NULL;
@@ -161,29 +226,27 @@ static void* gl_render_thread(void *arg) {
     XSetWindowAttributes swa;
     swa.colormap = XCreateColormap(dpy, root, vi->visual, AllocNone);
     swa.background_pixel = BlackPixel(dpy, screen);
+    swa.override_redirect = True;
     swa.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask |
                      ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
 
     Window gl_win = XCreateWindow(dpy, root, mon.x, mon.y, mon.width, mon.height, 0,
                                   vi->depth, InputOutput, vi->visual,
-                                  CWColormap | CWBackPixel | CWEventMask, &swa);
+                                  CWColormap | CWBackPixel | CWOverrideRedirect | CWEventMask, &swa);
 
-    /* Set fullscreen property so window managers place it above all panels and docks */
-    Atom net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
-    Atom net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
-    Atom net_wm_state_above = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+    int dummy_ev = 0, dummy_err = 0;
+    bool has_xfixes = XFixesQueryExtension(dpy, &dummy_ev, &dummy_err);
 
-    Atom states[2] = { net_wm_state_fullscreen, net_wm_state_above };
-    XChangeProperty(dpy, gl_win, net_wm_state, XA_ATOM, 32, PropModeReplace,
-                    (unsigned char*)states, 2);
+    Cursor custom_cursor = None;
+    if (!s_hide_cursor && has_xfixes) {
+        XFixesCursorImage *img = XFixesGetCursorImage(dpy);
+        if (img) {
+            custom_cursor = create_cursor_from_xfixes(dpy, img);
+            XFree(img);
+        }
+    }
 
-    /* Also remove decorations via Motif hints */
-    Atom motif_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
-    unsigned long hints[5] = { 2, 0, 0, 0, 0 }; /* decorations = 0 */
-    XChangeProperty(dpy, gl_win, motif_hints, motif_hints, 32, PropModeReplace,
-                    (unsigned char*)hints, 5);
-
-    /* Hide cursor if requested */
+    /* Hide cursor or apply game's custom cursor */
     Cursor blank_cursor = None;
     Pixmap blank_pix = None;
     if (s_hide_cursor) {
@@ -192,11 +255,77 @@ static void* gl_render_thread(void *arg) {
         memset(&dummy, 0, sizeof(dummy));
         blank_cursor = XCreatePixmapCursor(dpy, blank_pix, blank_pix, &dummy, &dummy, 0, 0);
         XDefineCursor(dpy, gl_win, blank_cursor);
+    } else if (custom_cursor != None) {
+        XDefineCursor(dpy, gl_win, custom_cursor);
     }
 
     XMapRaised(dpy, gl_win);
     XSetInputFocus(dpy, gl_win, RevertToPointerRoot, CurrentTime);
+
+    /* Grab keyboard so gl_win intercepts Escape, Alt+Tab, and Ctrl+Alt+S reliably without getting trapped */
+    bool kbd_grabbed = false;
+    for (int retry = 0; retry < 10; retry++) {
+        if (XGrabKeyboard(dpy, gl_win, False, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess) {
+            kbd_grabbed = true;
+            break;
+        }
+        usleep(10000);
+    }
+
+    /* Send ICCCM WM_TAKE_FOCUS so Wine / games activate internal keyboard input */
+    Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
+    Atom wm_take_focus = XInternAtom(dpy, "WM_TAKE_FOCUS", False);
+    XEvent tf_ev;
+    memset(&tf_ev, 0, sizeof(tf_ev));
+    tf_ev.type = ClientMessage;
+    tf_ev.xclient.window = target;
+    tf_ev.xclient.message_type = wm_protocols;
+    tf_ev.xclient.format = 32;
+    tf_ev.xclient.data.l[0] = (long)wm_take_focus;
+    tf_ev.xclient.data.l[1] = (long)CurrentTime;
+    XSendEvent(dpy, target, False, 0, &tf_ev);
     XSync(dpy, False);
+
+    /* Setup XRecord to monitor Wine's cursor updates on target window */
+    RecordCursorContext rec_cur_ctx;
+    memset(&rec_cur_ctx, 0, sizeof(rec_cur_ctx));
+    rec_cur_ctx.target = target;
+    XGetTransientForHint(dpy, target, &rec_cur_ctx.target_parent);
+
+    Display *rec_dpy = XOpenDisplay(NULL);
+    XRecordContext rec_ctx = 0;
+    pthread_t rec_thread;
+    bool rec_active = false;
+    RecordThreadArg rta;
+
+    if (rec_dpy) {
+        XRecordRange *range = XRecordAllocRange();
+        if (range) {
+            range->core_requests.first = X_ChangeWindowAttributes;
+            range->core_requests.last = X_ChangeWindowAttributes;
+            XRecordClientSpec spec = XRecordAllClients;
+            rec_ctx = XRecordCreateContext(dpy, 0, &spec, 1, &range, 1);
+            XFree(range);
+            XSync(dpy, False);
+
+            if (rec_ctx != 0) {
+                rta.rec_dpy = rec_dpy;
+                rta.rec_ctx = rec_ctx;
+                rta.cur_ctx = &rec_cur_ctx;
+                if (pthread_create(&rec_thread, NULL, record_thread_func, &rta) == 0) {
+                    rec_active = true;
+                }
+            }
+        }
+        if (!rec_active && rec_ctx != 0) {
+            XRecordFreeContext(dpy, rec_ctx);
+            rec_ctx = 0;
+        }
+        if (!rec_active && rec_dpy) {
+            XCloseDisplay(rec_dpy);
+            rec_dpy = NULL;
+        }
+    }
 
     GLXContext ctx = glXCreateNewContext(dpy, fb_config, GLX_RGBA_TYPE, NULL, GL_TRUE);
     glXMakeCurrent(dpy, gl_win, ctx);
@@ -260,6 +389,10 @@ static void* gl_render_thread(void *arg) {
 
     int y_from_top = mon.height - (vp_y + vp_h);
 
+    int target_abs_x = 0, target_abs_y = 0;
+    Window dummy_child;
+    XTranslateCoordinates(dpy, target, root, 0, 0, &target_abs_x, &target_abs_y, &dummy_child);
+
     while (s_running) {
         /* Process X events */
         while (XPending(dpy)) {
@@ -268,44 +401,95 @@ static void* gl_render_thread(void *arg) {
 
             if (ev.type == KeyPress) {
                 KeySym sym = XLookupKeysym(&ev.xkey, 0);
+                fprintf(stderr, "AspectScale Debug: KeyPress sym=0x%lx\n", (unsigned long)sym);
                 if (sym == XK_Escape) {
+                    fprintf(stderr, "AspectScale Debug: Exiting due to Escape key\n");
+                    s_running = false;
+                    break;
+                }
+                /* Check Alt+Tab - instantly restore to allow normal multitasking without locking */
+                if ((ev.xkey.state & Mod1Mask) && sym == XK_Tab) {
+                    fprintf(stderr, "AspectScale Debug: Exiting due to Alt+Tab\n");
                     s_running = false;
                     break;
                 }
                 /* Check Ctrl+Alt+S toggle */
                 if ((ev.xkey.state & (ControlMask | Mod1Mask)) == (ControlMask | Mod1Mask) &&
                     (sym == XK_s || sym == XK_S)) {
+                    fprintf(stderr, "AspectScale Debug: Exiting due to Ctrl+Alt+S\n");
                     s_running = false;
                     break;
                 }
                 /* Forward key event to target window */
                 ev.xkey.window = target;
-                XSendEvent(dpy, target, False, KeyPressMask, &ev);
+                ev.xkey.root = root;
+                ev.xkey.subwindow = None;
+                XSendEvent(dpy, target, True, KeyPressMask, &ev);
                 XSync(dpy, False);
             } else if (ev.type == KeyRelease) {
                 ev.xkey.window = target;
-                XSendEvent(dpy, target, False, KeyReleaseMask, &ev);
+                ev.xkey.root = root;
+                ev.xkey.subwindow = None;
+                XSendEvent(dpy, target, True, KeyReleaseMask, &ev);
                 XSync(dpy, False);
             } else if (ev.type == ButtonPress || ev.type == ButtonRelease) {
                 int cx = ev.xbutton.x - vp_x;
                 int cy = ev.xbutton.y - y_from_top;
-                if (cx >= 0 && cx < vp_w && cy >= 0 && cy < vp_h) {
-                    ev.xbutton.window = target;
-                    ev.xbutton.x = (int)lround((double)cx * (double)target_w / (double)vp_w);
-                    ev.xbutton.y = (int)lround((double)cy * (double)target_h / (double)vp_h);
-                    XSendEvent(dpy, target, False, (ev.type == ButtonPress) ? ButtonPressMask : ButtonReleaseMask, &ev);
-                    XSync(dpy, False);
-                }
+                int gx = (int)lround((double)cx * (double)target_w / (double)vp_w);
+                int gy = (int)lround((double)cy * (double)target_h / (double)vp_h);
+                if (gx < 0) gx = 0;
+                if (gx >= (int)target_w) gx = (int)target_w - 1;
+                if (gy < 0) gy = 0;
+                if (gy >= (int)target_h) gy = (int)target_h - 1;
+
+                ev.xbutton.window = target;
+                ev.xbutton.subwindow = None;
+                ev.xbutton.root = root;
+                ev.xbutton.x = gx;
+                ev.xbutton.y = gy;
+                ev.xbutton.x_root = target_abs_x + gx;
+                ev.xbutton.y_root = target_abs_y + gy;
+                fprintf(stderr, "AspectScale Debug: Forwarding click (%s) to target 0x%lx at local(%d, %d), root(%d, %d)\n",
+                        (ev.type == ButtonPress) ? "Press" : "Release",
+                        (unsigned long)target, gx, gy, ev.xbutton.x_root, ev.xbutton.y_root);
+                XSendEvent(dpy, target, True, (ev.type == ButtonPress) ? ButtonPressMask : ButtonReleaseMask, &ev);
+                XSync(dpy, False);
             } else if (ev.type == MotionNotify) {
                 int cx = ev.xmotion.x - vp_x;
                 int cy = ev.xmotion.y - y_from_top;
-                if (cx >= 0 && cx < vp_w && cy >= 0 && cy < vp_h) {
-                    ev.xmotion.window = target;
-                    ev.xmotion.x = (int)lround((double)cx * (double)target_w / (double)vp_w);
-                    ev.xmotion.y = (int)lround((double)cy * (double)target_h / (double)vp_h);
-                    XSendEvent(dpy, target, False, PointerMotionMask, &ev);
-                    XSync(dpy, False);
+                int gx = (int)lround((double)cx * (double)target_w / (double)vp_w);
+                int gy = (int)lround((double)cy * (double)target_h / (double)vp_h);
+                if (gx < 0) gx = 0;
+                if (gx >= (int)target_w) gx = (int)target_w - 1;
+                if (gy < 0) gy = 0;
+                if (gy >= (int)target_h) gy = (int)target_h - 1;
+
+                ev.xmotion.window = target;
+                ev.xmotion.subwindow = None;
+                ev.xmotion.root = root;
+                ev.xmotion.x = gx;
+                ev.xmotion.y = gy;
+                ev.xmotion.x_root = target_abs_x + gx;
+                ev.xmotion.y_root = target_abs_y + gy;
+                XSendEvent(dpy, target, True, PointerMotionMask, &ev);
+                XSync(dpy, False);
+            }
+        }
+
+        if (rec_cur_ctx.pending_valid) {
+            rec_cur_ctx.pending_valid = false;
+            Cursor new_cur = rec_cur_ctx.pending_cursor;
+            if (!s_hide_cursor) {
+                if (new_cur == None) {
+                    if (custom_cursor != None) {
+                        XDefineCursor(dpy, gl_win, custom_cursor);
+                    } else {
+                        XUndefineCursor(dpy, gl_win);
+                    }
+                } else {
+                    XDefineCursor(dpy, gl_win, new_cur);
                 }
+                XFlush(dpy);
             }
         }
 
@@ -315,6 +499,7 @@ static void* gl_render_thread(void *arg) {
         unsigned int cur_w = 0, cur_h = 0;
         if (!XGetGeometry(dpy, target, &r_ret, &tx, &ty, &cur_w, &cur_h, &tb, &td)) {
             /* Target window closed */
+            fprintf(stderr, "AspectScale Debug: XGetGeometry failed for target 0x%lx! Window may be closed or unmapped.\n", (unsigned long)target);
             s_running = false;
             break;
         }
@@ -346,10 +531,28 @@ static void* gl_render_thread(void *arg) {
         }
     }
 
+    /* Teardown XRecord */
+    if (rec_active) {
+        XRecordDisableContext(dpy, rec_ctx);
+        XSync(dpy, False);
+        pthread_join(rec_thread, NULL);
+        XRecordFreeContext(dpy, rec_ctx);
+        XCloseDisplay(rec_dpy);
+    }
+
+    /* Ungrab keyboard */
+    if (kbd_grabbed) {
+        XUngrabKeyboard(dpy, CurrentTime);
+    }
+
     /* Cleanup */
     if (blank_cursor != None) {
         XUndefineCursor(dpy, gl_win);
         XFreeCursor(dpy, blank_cursor);
+    }
+    if (custom_cursor != None) {
+        XUndefineCursor(dpy, gl_win);
+        XFreeCursor(dpy, custom_cursor);
     }
     if (blank_pix != None) {
         XFreePixmap(dpy, blank_pix);
@@ -366,7 +569,8 @@ static void* gl_render_thread(void *arg) {
     XFree(configs);
     XSync(dpy, False);
 
-    /* Refocus target window */
+    /* Refocus and raise target window */
+    XRaiseWindow(dpy, target);
     XSetInputFocus(dpy, target, RevertToPointerRoot, CurrentTime);
     XSync(dpy, False);
 
@@ -375,9 +579,16 @@ static void* gl_render_thread(void *arg) {
     return NULL;
 }
 
+static bool s_thread_created = false;
+
 bool gl_scaler_start(Display *dpy, Window target_win) {
     if (s_running) return false;
     if (target_win == None) return false;
+
+    if (s_thread_created) {
+        pthread_join(s_thread, NULL);
+        s_thread_created = false;
+    }
 
     if (!s_glXBindTexImage || !s_glXReleaseTexImage) {
         if (!gl_scaler_init(dpy)) return false;
@@ -390,13 +601,17 @@ bool gl_scaler_start(Display *dpy, Window target_win) {
         s_running = false;
         return false;
     }
+    s_thread_created = true;
     return true;
 }
 
 void gl_scaler_stop(void) {
-    if (!s_running) return;
+    if (!s_running && !s_thread_created) return;
     s_running = false;
-    pthread_join(s_thread, NULL);
+    if (s_thread_created) {
+        pthread_join(s_thread, NULL);
+        s_thread_created = false;
+    }
 }
 
 bool gl_scaler_toggle(Display *dpy, Window target_win) {
