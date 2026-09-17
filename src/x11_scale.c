@@ -1,10 +1,15 @@
+#define _GNU_SOURCE
 #include "x11_scale.h"
 #include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <ctype.h>
 #include <X11/keysym.h>
 
 #define MAX_HISTORY 64
@@ -48,6 +53,8 @@ static Atom atom_net_wm_window_type = None;
 static Atom atom_net_wm_window_type_desktop = None;
 static Atom atom_net_wm_window_type_dock = None;
 static Atom atom_motif_wm_hints = None;
+static Atom atom_net_wm_pid = None;
+static Atom atom_wine_flip = None;
 
 static SavedWindowState* find_history_entry(Window w) {
     for (int i = 0; i < s_history_count; i++) {
@@ -110,6 +117,8 @@ bool x11_scale_init(Display *dpy) {
     atom_net_wm_window_type_desktop = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", False);
     atom_net_wm_window_type_dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
     atom_motif_wm_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    atom_net_wm_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    atom_wine_flip = XInternAtom(dpy, "_WINE_ALLOW_FLIP", False);
 
     return true;
 }
@@ -565,3 +574,350 @@ void x11_ungrab_key(Display *dpy, unsigned int keycode, unsigned int modifiers) 
     }
     XSync(dpy, False);
 }
+
+pid_t x11_get_window_pid(Display *dpy, Window w) {
+    if (!dpy || w == None) return 0;
+    if (atom_net_wm_pid == None) {
+        atom_net_wm_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    }
+    if (atom_net_wm_pid == None) return 0;
+
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+    pid_t pid = 0;
+
+    if (XGetWindowProperty(dpy, w, atom_net_wm_pid, 0, 1, False,
+                           XA_CARDINAL, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) == Success) {
+        if (prop && nitems > 0) {
+            pid = (pid_t)(*(unsigned long *)prop);
+        }
+        if (prop) XFree(prop);
+    }
+
+    if (pid == 0) {
+        XWMHints *hints = XGetWMHints(dpy, w);
+        if (hints) {
+            if ((hints->flags & WindowGroupHint) && hints->window_group != None && hints->window_group != w) {
+                pid = x11_get_window_pid(dpy, hints->window_group);
+            }
+            XFree(hints);
+        }
+    }
+
+    if (pid == 0) {
+        Window root = DefaultRootWindow(dpy);
+        Window parent = None, r = None, *children = NULL;
+        unsigned int nchildren;
+        if (XQueryTree(dpy, w, &r, &parent, &children, &nchildren)) {
+            if (children) XFree(children);
+            if (parent != root && parent != None) {
+                pid = x11_get_window_pid(dpy, parent);
+            }
+        }
+    }
+
+    return pid;
+}
+
+static bool is_wine_helper_binary(const char *name) {
+    if (!name || !name[0]) return true;
+    static const char *helpers[] = {
+        "wine", "wine64", "wine-preloader", "wine64-preloader", "wineserver",
+        "wineboot.exe", "winevdm.exe", "explorer.exe", "services.exe", "winedevice.exe",
+        "plugplay.exe", "svchost.exe", "rpcss.exe", "tabtip.exe", "umu.exe", "start.exe",
+        "conhost.exe", "rundll32.exe", "dxvk_cache_builder.exe",
+        "wineboot", "winevdm", "explorer", "services", "winedevice",
+        "plugplay", "svchost", "rpcss", "tabtip", "umu", "start",
+        "conhost", "rundll32", "dxvk_cache_builder",
+        NULL
+    };
+    for (int i = 0; helpers[i]; i++) {
+        if (strcasecmp(name, helpers[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void extract_exe_basename(const char *path, char *out, size_t max_len) {
+    if (!path || !out || max_len == 0) return;
+    out[0] = '\0';
+
+    const char *start = path;
+    while (*start == ' ' || *start == '\t' || *start == '"' || *start == '\'') start++;
+    if (!*start) return;
+
+    const char *end = start + strlen(start) - 1;
+    while (end > start && (*end == ' ' || *end == '\t' || *end == '"' || *end == '\'')) end--;
+
+    const char *last_sep = start;
+    for (const char *s = start; s <= end; s++) {
+        if (*s == '/' || *s == '\\') {
+            last_sep = s + 1;
+        }
+    }
+
+    size_t len = (size_t)(end - last_sep + 1);
+    if (len >= max_len) len = max_len - 1;
+    memcpy(out, last_sep, len);
+    out[len] = '\0';
+}
+
+static bool find_exe_in_environ(pid_t pid, char *out_exe, size_t max_len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/environ", pid);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    char buf[4096];
+    size_t n;
+    char token[1024];
+    size_t tok_len = 0;
+    char game_name[128] = {0};
+
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] != '\0') {
+                if (tok_len + 1 < sizeof(token)) {
+                    token[tok_len++] = buf[i];
+                }
+            } else {
+                token[tok_len] = '\0';
+                if (strncmp(token, "EXE=", 4) == 0) {
+                    char base[128];
+                    extract_exe_basename(token + 4, base, sizeof(base));
+                    if (base[0] && !is_wine_helper_binary(base)) {
+                        snprintf(out_exe, max_len, "%s", base);
+                        fclose(f);
+                        return true;
+                    }
+                } else if (strncmp(token, "GAME_NAME=", 10) == 0 && !game_name[0]) {
+                    snprintf(game_name, sizeof(game_name), "%.127s", token + 10);
+                }
+                tok_len = 0;
+            }
+        }
+    }
+    fclose(f);
+
+    if (game_name[0]) {
+        snprintf(out_exe, max_len, "%s", game_name);
+        return true;
+    }
+    return false;
+}
+
+static bool find_exe_in_cmdline(pid_t pid, char *out_exe, size_t max_len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    char buf[4096];
+    size_t n;
+    char token[1024];
+    size_t tok_len = 0;
+    bool next_is_target = false;
+    char candidate[128] = {0};
+
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] != '\0') {
+                if (tok_len + 1 < sizeof(token)) {
+                    token[tok_len++] = buf[i];
+                }
+            } else {
+                token[tok_len] = '\0';
+                if (tok_len > 0) {
+                    if (next_is_target) {
+                        char base[128];
+                        extract_exe_basename(token, base, sizeof(base));
+                        if (base[0] && !is_wine_helper_binary(base)) {
+                            snprintf(out_exe, max_len, "%s", base);
+                            fclose(f);
+                            return true;
+                        }
+                        next_is_target = false;
+                    }
+
+                    if (strcasecmp(token, "--app-name") == 0 ||
+                        strcasecmp(token, "/exec") == 0 ||
+                        strcasecmp(token, "waitforexitandrun") == 0) {
+                        next_is_target = true;
+                    }
+
+                    const char *dot = strrchr(token, '.');
+                    if (dot && (strcasecmp(dot, ".exe") == 0 ||
+                                strcasecmp(dot, ".bat") == 0 ||
+                                strcasecmp(dot, ".cmd") == 0)) {
+                        char base[128];
+                        extract_exe_basename(token, base, sizeof(base));
+                        if (base[0] && !is_wine_helper_binary(base)) {
+                            snprintf(candidate, sizeof(candidate), "%s", base);
+                        }
+                    }
+                }
+                tok_len = 0;
+            }
+        }
+    }
+    fclose(f);
+
+    if (candidate[0]) {
+        snprintf(out_exe, max_len, "%s", candidate);
+        return true;
+    }
+    return false;
+}
+
+static bool find_exe_in_comm(pid_t pid, char *out_exe, size_t max_len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    char line[128];
+    if (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *cr = strchr(line, '\r');
+        if (cr) *cr = '\0';
+
+        if (line[0] && !is_wine_helper_binary(line)) {
+            const char *dot = strrchr(line, '.');
+            if (dot && strcasecmp(dot, ".exe") == 0) {
+                snprintf(out_exe, max_len, "%s", line);
+                fclose(f);
+                return true;
+            }
+        }
+    }
+    fclose(f);
+    return false;
+}
+
+static pid_t get_parent_pid(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[128];
+    pid_t ppid = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "PPid:", 5) == 0) {
+            ppid = (pid_t)atoi(line + 5);
+            break;
+        }
+    }
+    fclose(f);
+    return ppid;
+}
+
+static bool get_process_name_for_pid(pid_t pid, char *out_name, size_t max_len) {
+    if (pid <= 0 || !out_name || max_len == 0) return false;
+    out_name[0] = '\0';
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fgets(out_name, max_len, f)) {
+            char *nl = strchr(out_name, '\n');
+            if (nl) *nl = '\0';
+            char *cr = strchr(out_name, '\r');
+            if (cr) *cr = '\0';
+        }
+        fclose(f);
+        if (out_name[0]) return true;
+    }
+    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+    char link[256];
+    ssize_t len = readlink(path, link, sizeof(link) - 1);
+    if (len > 0) {
+        link[len] = '\0';
+        extract_exe_basename(link, out_name, max_len);
+        if (out_name[0]) return true;
+    }
+    return false;
+}
+
+bool x11_get_window_exe(Display *dpy, Window w, char *buf, size_t max_len, bool *out_is_wine) {
+    if (!buf || max_len == 0) return false;
+    buf[0] = '\0';
+    if (out_is_wine) *out_is_wine = false;
+    if (!dpy || w == None) return false;
+
+    pid_t pid = x11_get_window_pid(dpy, w);
+    bool is_wine = false;
+
+    // 1. Check window class hint
+    XClassHint ch = {NULL, NULL};
+    if (XGetClassHint(dpy, w, &ch)) {
+        if (ch.res_class) {
+            if (strcasecmp(ch.res_class, "wine") == 0 ||
+                strncasecmp(ch.res_class, "steam_app_", 10) == 0) {
+                is_wine = true;
+            }
+        }
+        if (ch.res_name) {
+            if (strcasecmp(ch.res_name, "wine") == 0 ||
+                strncasecmp(ch.res_name, "steam_app_", 10) == 0) {
+                is_wine = true;
+            }
+        }
+        if (ch.res_name) XFree(ch.res_name);
+        if (ch.res_class) XFree(ch.res_class);
+    }
+
+    // 2. Check X11 window atoms for Wine
+    if (!is_wine && atom_wine_flip != None) {
+        Atom act_type;
+        int act_fmt;
+        unsigned long nitems, bytes_after;
+        unsigned char *prop = NULL;
+        if (XGetWindowProperty(dpy, w, atom_wine_flip, 0, 1, False,
+                               AnyPropertyType, &act_type, &act_fmt,
+                               &nitems, &bytes_after, &prop) == Success) {
+            if (prop && nitems > 0) is_wine = true;
+            if (prop) XFree(prop);
+        }
+    }
+
+    // 3. Check /proc/<pid>/exe
+    if (pid > 0) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+        char exe_link[256] = {0};
+        ssize_t len = readlink(path, exe_link, sizeof(exe_link) - 1);
+        if (len > 0) {
+            exe_link[len] = '\0';
+            if (strcasestr(exe_link, "wine") != NULL || strcasestr(exe_link, "proton") != NULL) {
+                is_wine = true;
+            }
+        }
+    }
+
+    if (out_is_wine) *out_is_wine = is_wine;
+
+    if (pid > 0) {
+        if (is_wine) {
+            pid_t curr = pid;
+            for (int depth = 0; depth < 8 && curr > 1; depth++) {
+                if (find_exe_in_environ(curr, buf, max_len)) return true;
+                if (find_exe_in_cmdline(curr, buf, max_len)) return true;
+                if (find_exe_in_comm(curr, buf, max_len)) return true;
+                pid_t p = get_parent_pid(curr);
+                if (p <= 1 || p == curr) break;
+                curr = p;
+            }
+        } else {
+            if (get_process_name_for_pid(pid, buf, max_len)) {
+                return true;
+            }
+        }
+    }
+
+    return (buf[0] != '\0');
+}
+

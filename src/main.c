@@ -175,9 +175,13 @@ static gboolean autoscale_poll_cb(gpointer user_data) {
                 nam = ch.res_name;
             }
 
-            if (config_is_autoscale(cls, nam, title)) {
-                fprintf(stderr, "AspectScale Debug: autoscale triggered for win=0x%lx title='%s' class='%s'\n",
-                        (unsigned long)active, title, cls ? cls : "");
+            char exe_name[128] = {0};
+            bool is_wine = false;
+            x11_get_window_exe(g_app.main_dpy, active, exe_name, sizeof(exe_name), &is_wine);
+
+            if (config_is_autoscale(cls, nam, title, exe_name, is_wine)) {
+                fprintf(stderr, "AspectScale Debug: autoscale triggered for win=0x%lx title='%s' class='%s' exe='%s' wine=%d\n",
+                        (unsigned long)active, title, cls ? cls : "", exe_name, is_wine);
                 trigger_scale_window(active);
             }
 
@@ -262,10 +266,15 @@ static void on_remember_active_clicked(GtkMenuItem *item, gpointer user_data) {
         nam = ch.res_name;
     }
 
-    if (config_add_autoscale(cls, nam, title)) {
+    char exe_name[128] = {0};
+    bool is_wine = false;
+    x11_get_window_exe(g_app.main_dpy, active, exe_name, sizeof(exe_name), &is_wine);
+
+    if (config_add_autoscale(cls, nam, title, exe_name, is_wine)) {
         char msg[512];
+        const char *display_name = title[0] ? title : (exe_name[0] ? exe_name : (cls ? cls : "Window"));
         snprintf(msg, sizeof(msg), "Remembered \"%s\"!\nWill automatically scale to fullscreen when launched.",
-                 title[0] ? title : (cls ? cls : "Window"));
+                 display_name);
         notify_message("AspectScale", msg);
         rebuild_remembered_submenu();
     } else {

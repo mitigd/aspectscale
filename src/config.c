@@ -75,8 +75,14 @@ void config_init(void) {
         } else if (strcmp(section, "autoscale") == 0) {
             if (s_config.rule_count < MAX_AUTOSCALE_RULES && strlen(key) > 0) {
                 AutoScaleRule *r = &s_config.rules[s_config.rule_count++];
-                snprintf(r->identifier, sizeof(r->identifier), "%.127s", key);
-                snprintf(r->label, sizeof(r->label), "%.127s", val[0] ? val : key);
+                if (is_generic_wine_id(key) && val[0]) {
+                    // Migrate legacy generic wine runner entry (e.g. steam_app_default=RhemIISE)
+                    snprintf(r->identifier, sizeof(r->identifier), "%.127s", val);
+                    snprintf(r->label, sizeof(r->label), "%.127s", val);
+                } else {
+                    snprintf(r->identifier, sizeof(r->identifier), "%.127s", key);
+                    snprintf(r->label, sizeof(r->label), "%.127s", val[0] ? val : key);
+                }
             }
         }
     }
@@ -133,33 +139,134 @@ void config_set_scale_mode(ScaleFilterMode mode) {
     config_save();
 }
 
-bool config_is_autoscale(const char *res_class, const char *res_name, const char *title) {
+bool is_generic_wine_id(const char *str) {
+    if (!str || !str[0]) return false;
+    if (strcasecmp(str, "wine") == 0) return true;
+    if (strcasecmp(str, "wine64") == 0) return true;
+    if (strcasecmp(str, "wine-preloader") == 0) return true;
+    if (strcasecmp(str, "wine64-preloader") == 0) return true;
+    if (strcasecmp(str, "steam_app_default") == 0) return true;
+    if (strcasecmp(str, "steam_app_0") == 0) return true;
+    if (strncasecmp(str, "steam_app_", 10) == 0) return true;
+    if (strcasecmp(str, "explorer.exe") == 0) return true;
+    if (strcasecmp(str, "winevdm.exe") == 0) return true;
+    if (strcasecmp(str, "start.exe") == 0) return true;
+    if (strcasecmp(str, "winedevice.exe") == 0) return true;
+    return false;
+}
+
+static bool name_matches(const char *target, const char *pattern) {
+    if (!target || !pattern || !target[0] || !pattern[0]) return false;
+    // Exact case-insensitive match
+    if (strcasecmp(target, pattern) == 0) return true;
+
+    // Substring match
+    if (strcasestr(target, pattern) != NULL || strcasestr(pattern, target) != NULL) return true;
+
+    // Match stem (strip .exe if present)
+    char t_stem[128], p_stem[128];
+    snprintf(t_stem, sizeof(t_stem), "%s", target);
+    snprintf(p_stem, sizeof(p_stem), "%s", pattern);
+    char *dot = strrchr(t_stem, '.');
+    if (dot && strcasecmp(dot, ".exe") == 0) *dot = '\0';
+    dot = strrchr(p_stem, '.');
+    if (dot && strcasecmp(dot, ".exe") == 0) *dot = '\0';
+
+    if (t_stem[0] && p_stem[0]) {
+        if (strcasecmp(t_stem, p_stem) == 0) return true;
+        if (strcasestr(t_stem, p_stem) != NULL || strcasestr(p_stem, t_stem) != NULL) return true;
+    }
+
+    return false;
+}
+
+bool config_is_autoscale(const char *res_class, const char *res_name, const char *title, const char *exe_name, bool is_wine) {
     for (int i = 0; i < s_config.rule_count; i++) {
         const char *id = s_config.rules[i].identifier;
         const char *lbl = s_config.rules[i].label;
 
-        // Match identifier against class, name, title
-        if (res_class && (strcasecmp(id, res_class) == 0 || strcasestr(res_class, id) != NULL)) return true;
-        if (res_name && (strcasecmp(id, res_name) == 0 || strcasestr(res_name, id) != NULL)) return true;
-        if (title && strcasestr(title, id) != NULL) return true;
+        // If rule identifier is a generic wine runner (e.g. unmigrated legacy rule),
+        // NEVER match generic class/name directly! Only match against label!
+        if (is_generic_wine_id(id)) {
+            if (lbl && lbl[0]) {
+                if (exe_name && exe_name[0] && name_matches(exe_name, lbl)) return true;
+                if (title && title[0] && name_matches(title, lbl)) return true;
+            }
+            continue;
+        }
 
-        // Also match label against title, class, name
-        if (lbl && lbl[0]) {
-            if (title && strcasestr(title, lbl) != NULL) return true;
-            if (res_class && strcasestr(res_class, lbl) != NULL) return true;
-            if (res_name && strcasestr(res_name, lbl) != NULL) return true;
+        // 1. Match against actual EXE name
+        if (exe_name && exe_name[0]) {
+            if (name_matches(exe_name, id)) return true;
+            if (lbl && lbl[0] && name_matches(exe_name, lbl)) return true;
+        }
+
+        // 2. Match against window title
+        if (title && title[0]) {
+            if (name_matches(title, id)) return true;
+            if (lbl && lbl[0] && name_matches(title, lbl)) return true;
+        }
+
+        // 3. Match against class & name
+        if (!is_wine) {
+            if (res_class && !is_generic_wine_id(res_class)) {
+                if (name_matches(res_class, id)) return true;
+                if (lbl && lbl[0] && name_matches(res_class, lbl)) return true;
+            }
+            if (res_name && !is_generic_wine_id(res_name)) {
+                if (name_matches(res_name, id)) return true;
+                if (lbl && lbl[0] && name_matches(res_name, lbl)) return true;
+            }
+        } else {
+            // For wine windows, only match class/name if they are non-generic
+            if (res_class && !is_generic_wine_id(res_class) && name_matches(res_class, id)) return true;
+            if (res_name && !is_generic_wine_id(res_name) && name_matches(res_name, id)) return true;
         }
     }
     return false;
 }
 
-bool config_add_autoscale(const char *res_class, const char *res_name, const char *title) {
-    const char *id = (res_class && res_class[0]) ? res_class :
-                     ((res_name && res_name[0]) ? res_name : title);
-    if (!id || !id[0]) return false;
+bool config_add_autoscale(const char *res_class, const char *res_name, const char *title, const char *exe_name, bool is_wine) {
+    char id[128] = {0};
+    char lbl[128] = {0};
 
+    if (is_wine) {
+        if (exe_name && exe_name[0] && !is_generic_wine_id(exe_name)) {
+            snprintf(id, sizeof(id), "%s", exe_name);
+        } else if (title && title[0]) {
+            snprintf(id, sizeof(id), "%s", title);
+        } else if (res_name && res_name[0] && !is_generic_wine_id(res_name)) {
+            snprintf(id, sizeof(id), "%s", res_name);
+        } else {
+            snprintf(id, sizeof(id), "WineApp");
+        }
+    } else {
+        if (res_class && res_class[0]) {
+            snprintf(id, sizeof(id), "%s", res_class);
+        } else if (res_name && res_name[0]) {
+            snprintf(id, sizeof(id), "%s", res_name);
+        } else if (exe_name && exe_name[0]) {
+            snprintf(id, sizeof(id), "%s", exe_name);
+        } else if (title && title[0]) {
+            snprintf(id, sizeof(id), "%s", title);
+        } else {
+            return false;
+        }
+    }
+
+    if (title && title[0]) {
+        snprintf(lbl, sizeof(lbl), "%s", title);
+    } else if (exe_name && exe_name[0]) {
+        snprintf(lbl, sizeof(lbl), "%s", exe_name);
+    } else {
+        snprintf(lbl, sizeof(lbl), "%s", id);
+    }
+
+    // Check if already in list
     for (int i = 0; i < s_config.rule_count; i++) {
-        if (strcasecmp(s_config.rules[i].identifier, id) == 0) {
+        if (strcasecmp(s_config.rules[i].identifier, id) == 0 ||
+            (lbl[0] && strcasecmp(s_config.rules[i].label, lbl) == 0 &&
+             name_matches(s_config.rules[i].identifier, id))) {
             return false;
         }
     }
@@ -170,7 +277,6 @@ bool config_add_autoscale(const char *res_class, const char *res_name, const cha
 
     AutoScaleRule *r = &s_config.rules[s_config.rule_count++];
     snprintf(r->identifier, sizeof(r->identifier), "%.127s", id);
-    const char *lbl = (title && title[0]) ? title : id;
     snprintf(r->label, sizeof(r->label), "%.127s", lbl);
 
     config_save();
@@ -181,7 +287,8 @@ bool config_remove_autoscale(const char *identifier) {
     if (!identifier) return false;
     int idx = -1;
     for (int i = 0; i < s_config.rule_count; i++) {
-        if (strcasecmp(s_config.rules[i].identifier, identifier) == 0) {
+        if (strcasecmp(s_config.rules[i].identifier, identifier) == 0 ||
+            strcasecmp(s_config.rules[i].label, identifier) == 0) {
             idx = i;
             break;
         }

@@ -58,4 +58,12 @@ bool x11_grab_key(Display *dpy, unsigned int keycode, unsigned int modifiers);
 /* Ungrab global hotkey */
 void x11_ungrab_key(Display *dpy, unsigned int keycode, unsigned int modifiers);
 
+#include <sys/types.h>
+
+/* Get PID of the process owning the window */
+pid_t x11_get_window_pid(Display *dpy, Window w);
+
+/* Get process executable name or wine target exe for a window */
+bool x11_get_window_exe(Display *dpy, Window w, char *buf, size_t max_len, bool *out_is_wine);
+
 #endif /* X11_SCALE_H */

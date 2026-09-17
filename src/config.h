@@ -36,8 +36,9 @@ void config_set_notifications(bool enabled);
 ScaleFilterMode config_get_scale_mode(void);
 void config_set_scale_mode(ScaleFilterMode mode);
 
-bool config_is_autoscale(const char *res_class, const char *res_name, const char *title);
-bool config_add_autoscale(const char *res_class, const char *res_name, const char *title);
+bool is_generic_wine_id(const char *str);
+bool config_is_autoscale(const char *res_class, const char *res_name, const char *title, const char *exe_name, bool is_wine);
+bool config_add_autoscale(const char *res_class, const char *res_name, const char *title, const char *exe_name, bool is_wine);
 bool config_remove_autoscale(const char *identifier);
 void config_clear_autoscale(void);
 
