@@ -32,11 +32,12 @@ It uses a high-performance OpenGL/GLX pipeline (`GLX_EXT_texture_from_pixmap`) t
   - **Filtering (Bilinear)**: Smooth aspect-ratio corrected fullscreen scaling.
   - **No Filtering (Nearest Neighbor)**: Sharp, unfiltered aspect-ratio scaling without bilinear blur.
   - **Integer Scaling**: Pixel-perfect integer ratio scaling ($1\times, 2\times, 3\times\dots$) centered with pure black borders.
-- **Zero-Latency Direct Input**: Mouse clicks/motion and keyboard strokes are mapped and forwarded directly to the game.
+- **Scaled Input**: Mouse clicks/motion and keyboard strokes are mapped to the game. While native popup menus are open, the application receives original pointer events and the scaler draws the cursor at its scaled position. Cursor movement is magnified with the menu during this interaction; its desktop position is restored when the menus close. This requires XFixes 4 or newer.
 - **Instant Hotkeys**:
-  - **`Ctrl + Alt + S`**: Toggle Fullscreen Scaling / Restore
-  - **`Escape`**: Exit Fullscreen Scaling
-  - **`Ctrl + Alt + R`**: Restore windowed mode
+  - **`Ctrl + Alt + F`**: Toggle Fullscreen Scaling / Restore
+  - **`Ctrl + Alt + S`**: Cycle Windowed Scaling ($2\times, 3\times, 4\times\dots$, centers on the monitor and cycles back to $1\times$ at the maximum fit)
+  - **`Ctrl + Alt + R`**: Restore windowed mode ($1\times$)
+  - **`Escape`**: Dismiss an open native menu; otherwise exit scaling
 
 ---
 
@@ -45,6 +46,13 @@ It uses a high-performance OpenGL/GLX pipeline (`GLX_EXT_texture_from_pixmap`) t
 ```bash
 cd /home/mitigd/Projects/aspectscale
 make
+```
+
+Regression tests:
+
+```bash
+make test       # Focus/ownership protocol tests; no display required
+make test-x11   # Private Xvfb display; requires Xvfb, xauth and GLX support
 ```
 
 Install for current user (`~/.local/bin` and desktop entry):
@@ -69,8 +77,16 @@ aspectscale &
 
 ## Tray Menu Options
 
-- **Scale to Fullscreen [Ctrl+Alt+S]**
-- **Restore Windowed [Ctrl+Alt+R]**
+- **Scale to Fullscreen [Ctrl+Alt+F]**: Scales active window to full screen resolution with hardware OpenGL aspect correction.
+- **Scale Window (Next) [Ctrl+Alt+S]**: Cycles active window through $2\times, 3\times, 4\times\dots$ integer zoom without exceeding monitor resolution.
+- **Window Scale Preset**: Submenu with direct scale options:
+  - **1x (Restore Original)**
+  - **2x**
+  - **3x**
+  - **4x**
+  - **5x**
+  - **Max Fit (Fill Screen Integer)**
+- **Restore Windowed [Ctrl+Alt+R]**: Restores window to standard unscaled ($1\times$) state.
 - **Remember Active Window for Auto-Scale**: Adds the currently focused app to the auto-scale list.
 - **Remembered Apps (Auto-Scale)**: Submenu listing all saved rules with one-click removal.
 - **Scaling Mode**: Submenu with live radio selection:

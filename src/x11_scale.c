@@ -89,7 +89,7 @@ static SavedWindowState* get_or_create_history_entry(Window w) {
     return entry;
 }
 
-static Window get_toplevel_parent(Display *dpy, Window root, Window w) {
+Window x11_get_toplevel_parent(Display *dpy, Window root, Window w) {
     Window curr = w;
     Window parent = None, r = None, *children = NULL;
     unsigned int nchildren;
@@ -314,6 +314,9 @@ static void set_window_state(Display *dpy, Window w, Atom state_atom, bool add) 
 }
 
 static bool get_motif_hints(Display *dpy, Window w, struct MotifHints *hints) {
+    if (atom_motif_wm_hints == None) {
+        atom_motif_wm_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    }
     Atom actual_type;
     int actual_format;
     unsigned long nitems, bytes_after;
@@ -332,7 +335,10 @@ static bool get_motif_hints(Display *dpy, Window w, struct MotifHints *hints) {
     return false;
 }
 
-static void set_motif_decorations(Display *dpy, Window w, bool decorated) {
+void x11_set_motif_decorations(Display *dpy, Window w, bool decorated) {
+    if (atom_motif_wm_hints == None) {
+        atom_motif_wm_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    }
     struct MotifHints hints;
     memset(&hints, 0, sizeof(hints));
     hints.flags = MWM_HINTS_DECORATIONS;
@@ -420,7 +426,7 @@ bool x11_scale_window(Display *dpy, Window w, WindowScaleInfo *info) {
     set_window_state(dpy, w, atom_net_wm_state_fullscreen, false);
 
     /* 1. Make window borderless (remove titlebar & borders) */
-    set_motif_decorations(dpy, w, false);
+    x11_set_motif_decorations(dpy, w, false);
 
     /* 2. Create black backdrop window if not filling 100% of the monitor */
     if (new_w < mon.width || new_h < mon.height) {
@@ -439,7 +445,7 @@ bool x11_scale_window(Display *dpy, Window w, WindowScaleInfo *info) {
 
         /* Stack backdrop right behind the top-level window frame */
         Window root = DefaultRootWindow(dpy);
-        Window toplevel = get_toplevel_parent(dpy, root, w);
+        Window toplevel = x11_get_toplevel_parent(dpy, root, w);
         XWindowChanges wc;
         wc.sibling = toplevel;
         wc.stack_mode = Below;
@@ -511,7 +517,7 @@ bool x11_restore_window(Display *dpy, Window w, WindowScaleInfo *info) {
         XChangeProperty(dpy, w, atom_motif_wm_hints, atom_motif_wm_hints, 32,
                         PropModeReplace, (unsigned char *)&hist->orig_hints, 5);
     } else {
-        set_motif_decorations(dpy, w, true);
+        x11_set_motif_decorations(dpy, w, true);
     }
 
     /* 4. Restore original window geometry */

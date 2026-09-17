@@ -1,3 +1,6 @@
 *.o
 aspectscale
 *.log
+docs/
+scratch/
+tests/

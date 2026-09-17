@@ -58,6 +58,12 @@ bool x11_grab_key(Display *dpy, unsigned int keycode, unsigned int modifiers);
 /* Ungrab global hotkey */
 void x11_ungrab_key(Display *dpy, unsigned int keycode, unsigned int modifiers);
 
+/* Get top-level window manager frame parent */
+Window x11_get_toplevel_parent(Display *dpy, Window root, Window w);
+
+/* Set Motif window decorations (titlebar and borders) */
+void x11_set_motif_decorations(Display *dpy, Window w, bool decorated);
+
 #include <sys/types.h>
 
 /* Get PID of the process owning the window */
