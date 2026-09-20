@@ -32,10 +32,12 @@ test-x11: $(OBJS)
 	    -o "$$test_dir/popup" $(LIBS); \
 	$(CC) $(CFLAGS) tests/scaler_menu_test.c $(filter-out src/main.o,$(OBJS)) \
 	    -o "$$test_dir/scaler" $(LIBS); \
+	$(CC) $(CFLAGS) tests/virtual_desktop_test.c $(filter-out src/main.o,$(OBJS)) \
+	    -o "$$test_dir/virtual" $(LIBS); \
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections tests/overlay_stack_test.c \
 	    -Wl,--gc-sections -o "$$test_dir/stack" $(LIBS); \
 	xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
-	    sh -ec '"$$3"; "$$1"; "$$2" 2; "$$2" 3; "$$2" 0' sh "$$test_dir/popup" "$$test_dir/scaler" "$$test_dir/stack"
+	    sh -ec '"$$3"; "$$1"; "$$2" 2; "$$2" 3; "$$2" 0; "$$4" 2; "$$4" 0' sh "$$test_dir/popup" "$$test_dir/scaler" "$$test_dir/stack" "$$test_dir/virtual"
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)

@@ -76,9 +76,87 @@ typedef struct {
     unsigned int width;
     unsigned int height;
     bool active;
+    bool internal; /* Already rendered in the target Composite image. */
 } TrackedPopup;
 
 #define MAX_TRACKED_POPUPS 16
+
+/* X ancestry and Win32 transient ownership are different relationships. */
+static bool is_descendant(Display *dpy, Window ancestor, Window w) {
+    for (int depth = 0; w != None && depth < 64; depth++) {
+        if (w == ancestor) return true;
+        Window root, parent, *children = NULL;
+        unsigned int count;
+        if (!XQueryTree(dpy, w, &root, &parent, &children, &count)) return false;
+        if (children) XFree(children);
+        if (parent == w) break;
+        w = parent;
+    }
+    return false;
+}
+
+/* Subscribe before enumerating, so later children cannot escape observation.
+ * Seed existing mapped windows through the same classification path. */
+static void watch_children(Display *dpy, Window w, int depth) {
+    if (depth >= 64) return;
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa)) return;
+    XSelectInput(dpy, w, wa.your_event_mask | SubstructureNotifyMask |
+                 StructureNotifyMask | PropertyChangeMask);
+    Window root, parent, *children = NULL;
+    unsigned int count;
+    if (!XQueryTree(dpy, w, &root, &parent, &children, &count)) return;
+    for (unsigned int i = 0; i < count; i++) {
+        watch_children(dpy, children[i], depth + 1);
+        XEvent ev = {0};
+        ev.xmap.type = MapNotify;
+        ev.xmap.window = children[i];
+        ev.xmap.event = w;
+        XPutBackEvent(dpy, &ev);
+    }
+    if (children) XFree(children);
+}
+
+/* Find the input-selecting child under a target-local point. Wine's drawable
+ * client leaf may select only Exposure; its whole window owns mouse input. */
+static Window pointer_receiver(Display *dpy, Window target, int x, int y, long mask) {
+    Window w = target, receiver = target;
+    for (int depth = 0; depth < 64; depth++) {
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(dpy, w, &wa)) break;
+        if (wa.all_event_masks & mask) receiver = w;
+        Window child;
+        int wx, wy;
+        if (!XTranslateCoordinates(dpy, target, w, x, y, &wx, &wy, &child) ||
+            child == None || child == w) break;
+        w = child;
+    }
+    return receiver;
+}
+
+static void forward_pointer(Display *dpy, Window root, Window target, Window receiver,
+                            int x, int y, long mask, XEvent *ev) {
+    Window child;
+    int wx, wy, rx, ry;
+    if (!XTranslateCoordinates(dpy, target, receiver, x, y, &wx, &wy, &child) ||
+        !XTranslateCoordinates(dpy, target, root, x, y, &rx, &ry, &child)) return;
+    if (ev->type == MotionNotify) {
+        ev->xmotion.window = receiver;
+        ev->xmotion.root = root;
+        ev->xmotion.subwindow = None;
+        ev->xmotion.x = wx; ev->xmotion.y = wy;
+        ev->xmotion.x_root = rx; ev->xmotion.y_root = ry;
+        ev->xmotion.same_screen = True;
+    } else {
+        ev->xbutton.window = receiver;
+        ev->xbutton.root = root;
+        ev->xbutton.subwindow = None;
+        ev->xbutton.x = wx; ev->xbutton.y = wy;
+        ev->xbutton.x_root = rx; ev->xbutton.y_root = ry;
+        ev->xbutton.same_screen = True;
+    }
+    XSendEvent(dpy, receiver, False, mask, ev);
+}
 
 /* Follow explicit ownership, not resource-ID masks or process IDs: Wine's
  * IME and helper windows share those with the application. Bound the walk to
@@ -89,7 +167,7 @@ static bool is_target_subwindow(Display *dpy, Window target, Window w) {
         Window owner = None;
         if (!XGetTransientForHint(dpy, w, &owner) || owner == None || owner == w)
             return false;
-        if (owner == target) return true;
+        if (is_descendant(dpy, target, owner)) return true;
         w = owner;
     }
     return false;
@@ -146,11 +224,12 @@ static void cleanup_popup(Display *dpy, TrackedPopup *p, bool is_unmap) {
         XFreePixmap(dpy, p->pix);
         p->pix = 0;
     }
-    if (is_unmap && p->win != None) {
+    if (is_unmap && !p->internal && p->win != None) {
         XCompositeUnredirectWindow(dpy, p->win, CompositeRedirectAutomatic);
     }
     p->win = None;
     p->active = false;
+    p->internal = false;
 }
 
 /* Follow the WM's position for the real client. Never lower a managed
@@ -433,31 +512,38 @@ static void* gl_render_thread(void *arg) {
 
     Window toplevel_frame = x11_get_toplevel_parent(dpy, root, target);
 
-    /* Calculate gl_win size and position */
+    /* Calculate gl_win size and position and viewport geometry */
     int win_w = 0, win_h = 0, win_x = 0, win_y = 0;
+    int vp_w = 0, vp_h = 0, vp_x = 0, vp_y = 0, y_from_top = 0;
 
     if (is_fullscreen) {
         win_w = mon.width;
         win_h = mon.height;
         win_x = mon.x;
         win_y = mon.y;
+        calculate_viewport(s_scale_mode, target_w, target_h, &mon, &vp_x, &vp_y, &vp_w, &vp_h, &y_from_top);
     } else {
         win_w = current_factor * (int)target_w;
         win_h = current_factor * (int)target_h;
 
-        /* Remove frame decorations from target so its borders/titlebars don't peek out */
-        x11_set_motif_decorations(dpy, target, false);
-
         /* Each scale cycle starts centered on the target monitor. */
         win_x = mon.x + (mon.width - win_w) / 2;
         win_y = mon.y + (mon.height - win_h) / 2;
-
-        /* Position target frame centered directly under gl_win so it is 100% physically covered */
-        int target_under_x = win_x + (win_w - (int)target_w) / 2;
-        int target_under_y = win_y + (win_h - (int)target_h) / 2;
-        XMoveWindow(dpy, toplevel_frame, target_under_x, target_under_y);
-        XSync(dpy, False);
+        vp_w = win_w;
+        vp_h = win_h;
+        vp_x = 0;
+        vp_y = 0;
+        y_from_top = 0;
     }
+
+    /* Remove frame decorations from target so its borders/titlebars don't peek out */
+    x11_set_motif_decorations(dpy, target, false);
+
+    /* Position target frame centered directly under viewport so it is 100% physically covered */
+    int target_under_x = win_x + vp_x + (vp_w - (int)target_w) / 2;
+    int target_under_y = win_y + y_from_top + (vp_h - (int)target_h) / 2;
+    XMoveWindow(dpy, toplevel_frame, target_under_x, target_under_y);
+    XSync(dpy, False);
 
     /* Choose FBConfig that supports window and pixmap texturing */
     int fb_attribs[] = {
@@ -477,11 +563,9 @@ static void* gl_render_thread(void *arg) {
         configs = glXChooseFBConfig(dpy, screen, fb_attribs, &nconfigs);
         if (!configs || nconfigs == 0) {
             s_running = false;
-            if (!is_fullscreen) {
-                x11_set_motif_decorations(dpy, target, true);
-                XMoveWindow(dpy, toplevel_frame, target_orig_x, target_orig_y);
-                XRaiseWindow(dpy, target);
-            }
+            x11_set_motif_decorations(dpy, target, true);
+            XMoveWindow(dpy, toplevel_frame, target_orig_x, target_orig_y);
+            XRaiseWindow(dpy, target);
             XCloseDisplay(dpy);
             return NULL;
         }
@@ -532,9 +616,7 @@ static void* gl_render_thread(void *arg) {
     XMapRaised(dpy, gl_win);
 
     /* Immediately ensure gl_win is stacked above target's frame window */
-    if (!is_fullscreen) {
-        position_overlay(dpy, root, toplevel_frame, gl_win, NULL);
-    }
+    position_overlay(dpy, root, toplevel_frame, gl_win, NULL);
 
     /* Track root substructure events to intercept Wine/app popup menus and new dialog windows */
     XSelectInput(dpy, root, SubstructureNotifyMask);
@@ -543,6 +625,8 @@ static void* gl_render_thread(void *arg) {
 
     TrackedPopup popups[MAX_TRACKED_POPUPS];
     memset(popups, 0, sizeof(popups));
+    watch_children(dpy, target, 0);
+    Window pressed_receiver[256] = {0};
     struct { Window win, frame; } dialogs[MAX_TRACKED_POPUPS];
     int dialog_count = 0;
     Window active_dialog = None;
@@ -640,15 +724,8 @@ static void* gl_render_thread(void *arg) {
 
     glEnable(GL_TEXTURE_2D);
 
-    int vp_w = 0, vp_h = 0, vp_x = 0, vp_y = 0, y_from_top = 0;
     if (is_fullscreen) {
         calculate_viewport(current_mode, target_w, target_h, &mon, &vp_x, &vp_y, &vp_w, &vp_h, &y_from_top);
-    } else {
-        vp_w = win_w;
-        vp_h = win_h;
-        vp_x = 0;
-        vp_y = 0;
-        y_from_top = 0;
     }
 
     /* Window dragging state for Alt + Drag */
@@ -687,10 +764,37 @@ static void* gl_render_thread(void *arg) {
                 XWindowAttributes event_wa;
                 if (!XGetWindowAttributes(dpy, w, &event_wa) || event_wa.class != InputOutput)
                     continue;
+                bool internal = w != target && is_descendant(dpy, target, w);
+                if (internal && (ev.type == CreateNotify || ev.type == ReparentNotify))
+                    watch_children(dpy, w, 0);
                 int override_redirect = event_wa.override_redirect;
 
                 if (w != gl_win && w != toplevel_frame && is_target_subwindow(dpy, target, w)) {
-                    if (override_redirect) {
+                    if (internal) {
+                        /* Owned child menus AND dialogs stay in the desktop's
+                         * native stacking and Composite image. Only input needs
+                         * to switch to source coordinates during their lifetime. */
+                        if (event_wa.map_state != IsViewable ||
+                            event_wa.width <= 1 || event_wa.height <= 1) continue;
+                        int slot = -1;
+                        for (int i = 0; i < MAX_TRACKED_POPUPS; i++) {
+                            if (popups[i].active && popups[i].win == w) { slot = i; break; }
+                            if (!popups[i].active && slot < 0) slot = i;
+                        }
+                        if (slot >= 0) {
+                            popups[slot].win = w;
+                            popups[slot].active = true;
+                            popups[slot].internal = true;
+                            int sx, sy;
+                            XTranslateCoordinates(dpy, target, root, 0, 0, &sx, &sy, &dummy_child);
+                            PopupInputTransform transform = {
+                                sx, sy, win_x + vp_x, win_y + y_from_top,
+                                (double)vp_w / target_w, (double)vp_h / target_h
+                            };
+                            if (active_dialog == None && has_xfixes)
+                                popup_input_begin(dpy, gl_win, &popup_input, &transform);
+                        }
+                    } else if (override_redirect) {
                         /* Lower popup behind gl_win so unscaled popup does not appear on screen */
                         if (ev.type == CreateNotify || ev.type == MapNotify) {
                             XLowerWindow(dpy, w);
@@ -797,6 +901,8 @@ static void* gl_render_thread(void *arg) {
                 continue;
             } else if (ev.type == UnmapNotify || ev.type == DestroyNotify) {
                 Window w = (ev.type == UnmapNotify) ? ev.xunmap.window : ev.xdestroywindow.window;
+                for (unsigned int button = 0; button < 256; button++)
+                    if (pressed_receiver[button] == w) pressed_receiver[button] = None;
                 for (int i = 0; i < MAX_TRACKED_POPUPS; i++) {
                     if (popups[i].active && popups[i].win == w) {
                         cleanup_popup(dpy, &popups[i], (ev.type == UnmapNotify));
@@ -824,8 +930,24 @@ static void* gl_render_thread(void *arg) {
             }
 
             if (popup_input.active && (ev.type == ButtonPress ||
-                ev.type == ButtonRelease || ev.type == MotionNotify))
+                ev.type == ButtonRelease || ev.type == MotionNotify)) {
+                /* A very short click may have queued its overlay release
+                 * before the input shape changed. Native releases never arrive
+                 * here, but this queued release still needs forwarding once. */
+                if (ev.type == ButtonRelease && ev.xbutton.window == gl_win &&
+                    ev.xbutton.button < 256 && pressed_receiver[ev.xbutton.button] != None) {
+                    int gx = (int)lround((ev.xbutton.x - vp_x) * (double)target_w / vp_w);
+                    int gy = (int)lround((ev.xbutton.y - y_from_top) * (double)target_h / vp_h);
+                    if (gx < 0) gx = 0;
+                    if (gy < 0) gy = 0;
+                    if (gx >= (int)target_w) gx = target_w - 1;
+                    if (gy >= (int)target_h) gy = target_h - 1;
+                    forward_pointer(dpy, root, target, pressed_receiver[ev.xbutton.button],
+                                    gx, gy, ButtonReleaseMask, &ev);
+                    pressed_receiver[ev.xbutton.button] = None;
+                }
                 continue;
+            }
 
             if (ev.type == KeyPress) {
                 KeySym sym = XLookupKeysym(&ev.xkey, 0);
@@ -901,9 +1023,6 @@ static void* gl_render_thread(void *arg) {
                     continue;
                 }
 
-                int target_abs_x = 0, target_abs_y = 0;
-                XTranslateCoordinates(dpy, target, root, 0, 0, &target_abs_x, &target_abs_y, &dummy_child);
-
                 int cx = ev.xbutton.x - vp_x;
                 int cy = ev.xbutton.y - y_from_top;
                 int gx = (int)lround((double)cx * (double)target_w / (double)vp_w);
@@ -915,34 +1034,35 @@ static void* gl_render_thread(void *arg) {
 
                 XUngrabPointer(dpy, ev.xbutton.time);
                 /* Ensure Wine has input focus so click is directly processed */
-                focus_client(dpy, root, target, CurrentTime);
+                Window receiver = pointer_receiver(dpy, target, gx, gy, ButtonPressMask);
+                if (ev.xbutton.button < 256) pressed_receiver[ev.xbutton.button] = receiver;
+                /* Wine can query/confine the real cursor during activation and
+                 * menu tracking, before the popup's MapNotify reaches us. Put
+                 * it at the intended source point BEFORE delivering the press.
+                 * Keep native input through its release (and any open menus). */
+                if (receiver != target && has_xfixes) {
+                    int sx, sy;
+                    XTranslateCoordinates(dpy, target, root, 0, 0, &sx, &sy, &dummy_child);
+                    PopupInputTransform transform = {
+                        sx, sy, win_x + vp_x, win_y + y_from_top,
+                        (double)vp_w / target_w, (double)vp_h / target_h
+                    };
+                    if (popup_input_begin_at(dpy, gl_win, &popup_input, &transform, sx + gx, sy + gy)) {
+                        XSync(dpy, False);
+                    }
+                }
+                focus_client(dpy, root, receiver, CurrentTime);
 
                 /* Send MotionNotify immediately preceding click so Wine knows cursor position */
                 XEvent mev;
                 memset(&mev, 0, sizeof(mev));
                 mev.type = MotionNotify;
-                mev.xmotion.window = target;
-                mev.xmotion.root = root;
-                mev.xmotion.subwindow = None;
                 mev.xmotion.time = ev.xbutton.time;
-                mev.xmotion.x = gx;
-                mev.xmotion.y = gy;
-                mev.xmotion.x_root = target_abs_x + gx;
-                mev.xmotion.y_root = target_abs_y + gy;
                 mev.xmotion.state = ev.xbutton.state;
-                mev.xmotion.same_screen = True;
-                XSendEvent(dpy, target, True, PointerMotionMask, &mev);
+                forward_pointer(dpy, root, target, receiver, gx, gy, PointerMotionMask, &mev);
+                forward_pointer(dpy, root, target, receiver, gx, gy, ButtonPressMask, &ev);
 
-                ev.xbutton.window = target;
-                ev.xbutton.subwindow = None;
-                ev.xbutton.root = root;
-                ev.xbutton.x = gx;
-                ev.xbutton.y = gy;
-                ev.xbutton.x_root = target_abs_x + gx;
-                ev.xbutton.y_root = target_abs_y + gy;
-                XSendEvent(dpy, target, True, ButtonPressMask, &ev);
-
-                if (!is_fullscreen && active_dialog_frame == None) {
+                if (active_dialog_frame == None) {
                     position_overlay(dpy, root, toplevel_frame, gl_win, popups);
                 }
                 XSync(dpy, False);
@@ -951,9 +1071,6 @@ static void* gl_render_thread(void *arg) {
                     is_dragging = false;
                     continue;
                 }
-
-                int target_abs_x = 0, target_abs_y = 0;
-                XTranslateCoordinates(dpy, target, root, 0, 0, &target_abs_x, &target_abs_y, &dummy_child);
 
                 int cx = ev.xbutton.x - vp_x;
                 int cy = ev.xbutton.y - y_from_top;
@@ -964,14 +1081,10 @@ static void* gl_render_thread(void *arg) {
                 if (gy < 0) gy = 0;
                 if (gy >= (int)target_h) gy = (int)target_h - 1;
 
-                ev.xbutton.window = target;
-                ev.xbutton.subwindow = None;
-                ev.xbutton.root = root;
-                ev.xbutton.x = gx;
-                ev.xbutton.y = gy;
-                ev.xbutton.x_root = target_abs_x + gx;
-                ev.xbutton.y_root = target_abs_y + gy;
-                XSendEvent(dpy, target, True, ButtonReleaseMask, &ev);
+                Window receiver = ev.xbutton.button < 256 ? pressed_receiver[ev.xbutton.button] : None;
+                if (receiver == None) receiver = pointer_receiver(dpy, target, gx, gy, ButtonReleaseMask);
+                forward_pointer(dpy, root, target, receiver, gx, gy, ButtonReleaseMask, &ev);
+                if (ev.xbutton.button < 256) pressed_receiver[ev.xbutton.button] = None;
                 XSync(dpy, False);
             } else if (ev.type == MotionNotify) {
                 if (is_dragging) {
@@ -985,9 +1098,6 @@ static void* gl_render_thread(void *arg) {
                     continue;
                 }
 
-                int target_abs_x = 0, target_abs_y = 0;
-                XTranslateCoordinates(dpy, target, root, 0, 0, &target_abs_x, &target_abs_y, &dummy_child);
-
                 int cx = ev.xmotion.x - vp_x;
                 int cy = ev.xmotion.y - y_from_top;
                 int gx = (int)lround((double)cx * (double)target_w / (double)vp_w);
@@ -997,14 +1107,14 @@ static void* gl_render_thread(void *arg) {
                 if (gy < 0) gy = 0;
                 if (gy >= (int)target_h) gy = (int)target_h - 1;
 
-                ev.xmotion.window = target;
-                ev.xmotion.subwindow = None;
-                ev.xmotion.root = root;
-                ev.xmotion.x = gx;
-                ev.xmotion.y = gy;
-                ev.xmotion.x_root = target_abs_x + gx;
-                ev.xmotion.y_root = target_abs_y + gy;
-                XSendEvent(dpy, target, True, PointerMotionMask, &ev);
+                Window receiver = None;
+                for (unsigned int button = 1; button <= 5; button++)
+                    if ((ev.xmotion.state & (Button1Mask << (button - 1))) && pressed_receiver[button]) {
+                        receiver = pressed_receiver[button];
+                        break;
+                    }
+                if (receiver == None) receiver = pointer_receiver(dpy, target, gx, gy, PointerMotionMask);
+                forward_pointer(dpy, root, target, receiver, gx, gy, PointerMotionMask, &ev);
                 XSync(dpy, False);
             }
         }
@@ -1098,12 +1208,18 @@ static void* gl_render_thread(void *arg) {
             target_h = cur_h;
             if (is_fullscreen) {
                 calculate_viewport(current_mode, target_w, target_h, &mon, &vp_x, &vp_y, &vp_w, &vp_h, &y_from_top);
+                int target_under_x = win_x + vp_x + (vp_w - (int)target_w) / 2;
+                int target_under_y = win_y + y_from_top + (vp_h - (int)target_h) / 2;
+                XMoveWindow(dpy, toplevel_frame, target_under_x, target_under_y);
             } else {
                 win_w = current_factor * (int)target_w;
                 win_h = current_factor * (int)target_h;
                 XResizeWindow(dpy, gl_win, (unsigned int)win_w, (unsigned int)win_h);
                 vp_w = win_w;
                 vp_h = win_h;
+                int target_under_x = win_x + (win_w - (int)target_w) / 2;
+                int target_under_y = win_y + (win_h - (int)target_h) / 2;
+                XMoveWindow(dpy, toplevel_frame, target_under_x, target_under_y);
             }
         }
 
@@ -1127,7 +1243,7 @@ static void* gl_render_thread(void *arg) {
         int stack_count = 0;
         stack[stack_count++] = gl_win;
         for (int i = MAX_TRACKED_POPUPS - 1; i >= 0; i--)
-            if (popups[i].active) stack[stack_count++] = popups[i].win;
+            if (popups[i].active && !popups[i].internal) stack[stack_count++] = popups[i].win;
         if (stack_count > 1) XRestackWindows(dpy, stack, stack_count);
 
         /* Render 2D canvas with orthographic projection */
@@ -1237,12 +1353,10 @@ static void* gl_render_thread(void *arg) {
         XCloseDisplay(rec_dpy);
     }
 
-    /* Restore target window position and decorations if in windowed mode */
-    if (!is_fullscreen) {
-        x11_set_motif_decorations(dpy, target, true);
-        XMoveWindow(dpy, toplevel_frame, target_orig_x, target_orig_y);
-        XRaiseWindow(dpy, target);
-    }
+    /* Restore target window position and decorations */
+    x11_set_motif_decorations(dpy, target, true);
+    XMoveWindow(dpy, toplevel_frame, target_orig_x, target_orig_y);
+    XRaiseWindow(dpy, target);
 
     /* Cleanup tracked popups */
     for (int i = 0; i < MAX_TRACKED_POPUPS; i++) {

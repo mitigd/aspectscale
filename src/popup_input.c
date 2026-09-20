@@ -11,9 +11,7 @@ void popup_input_to_view(const PopupInputTransform *t, int x, int y, int *vx, in
 bool popup_input_begin(Display *dpy, Window overlay, PopupInput *input,
                        const PopupInputTransform *transform) {
     if (input->active) return true;
-    int major = 4, minor = 0;
-    if (transform->scale_x <= 0 || transform->scale_y <= 0 ||
-        !XFixesQueryVersion(dpy, &major, &minor) || major < 4) return false;
+    if (transform->scale_x <= 0 || transform->scale_y <= 0) return false;
     Window root = DefaultRootWindow(dpy), rr, child;
     int rx, ry, wx, wy;
     unsigned int mask;
@@ -22,6 +20,16 @@ bool popup_input_begin(Display *dpy, Window overlay, PopupInput *input,
 
     int x = transform->source_x + (int)lround((rx - transform->view_x) / transform->scale_x);
     int y = transform->source_y + (int)lround((ry - transform->view_y) / transform->scale_y);
+    return popup_input_begin_at(dpy, overlay, input, transform, x, y);
+}
+
+bool popup_input_begin_at(Display *dpy, Window overlay, PopupInput *input,
+                          const PopupInputTransform *transform, int x, int y) {
+    if (input->active) return true;
+    int major = 4, minor = 0;
+    if (transform->scale_x <= 0 || transform->scale_y <= 0 ||
+        !XFixesQueryVersion(dpy, &major, &minor) || major < 4) return false;
+    Window root = DefaultRootWindow(dpy);
     XserverRegion empty = XFixesCreateRegion(dpy, NULL, 0);
     XFixesSetWindowShapeRegion(dpy, overlay, ShapeInput, 0, 0, empty);
     XFixesDestroyRegion(dpy, empty);

@@ -19,6 +19,10 @@ typedef struct {
  * The renderer displays the cursor using this same transform. */
 bool popup_input_begin(Display *dpy, Window overlay, PopupInput *input,
                        const PopupInputTransform *transform);
+/* Enter before dispatching a child click: focus/grabs may query or confine the
+ * physical cursor immediately. x/y are the intended source root coordinates. */
+bool popup_input_begin_at(Display *dpy, Window overlay, PopupInput *input,
+                          const PopupInputTransform *transform, int x, int y);
 void popup_input_end(Display *dpy, Window overlay, PopupInput *input);
 void popup_input_cleanup(Display *dpy, Window overlay, PopupInput *input);
 void popup_input_to_view(const PopupInputTransform *t, int x, int y, int *vx, int *vy);
